@@ -25,10 +25,12 @@ use simple_logger::SimpleLogger;
 use std::env;
 use std::fs::File;
 use std::io::{self, Write};
+use std::net::TcpListener as StdTcpListener;
 use std::net::{AddrParseError, IpAddr};
 use std::path::Path;
 use sysinfo::{get_current_pid, System};
 use tokio::net::TcpListener;
+use tokio::runtime::Runtime;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -76,18 +78,13 @@ async fn main_channel(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .env()
-        .init()
-        .unwrap();
-    let args = Args::parse();
-    log::info!("Running tunnel on {}:{}", args.bind_ip, args.bind_port);
+async fn tokio_main(
+    args: Args,
+    std_listener: StdTcpListener,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::from_std(std_listener)?;
     let bind_address = parse_ip_from_uri_host(&args.bind_ip)?;
     let (stream_state, stream_sender) = reconnecting_stream::StreamState::new();
-    let bind_sockaddr = (bind_address, args.bind_port);
-    let listener = TcpListener::bind(bind_sockaddr).await?;
     let listener_port = listener.local_addr()?.port();
     log::info!("bound to {}:{}", bind_address, listener_port);
     let main_chan = tokio::spawn(main_channel(listener, stream_state));
@@ -99,6 +96,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_sender.sender,
         stream_sender.receiver,
     )?;
+
+    if let Err(e) = server.run().await {
+        log::error!("Server died due to {}", e);
+    }
+
+    main_chan.await?;
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .env()
+        .init()
+        .unwrap();
+    let args = Args::parse();
+    log::info!("Running tunnel on {}:{}", args.bind_ip, args.bind_port);
+    let bind_address = parse_ip_from_uri_host(&args.bind_ip)?;
+    let bind_sockaddr = (bind_address, args.bind_port);
+    let rt = Runtime::new()?;
+    let listener = StdTcpListener::bind(bind_sockaddr)?;
+
     if args.kill_old {
         let mut sys = System::new_all();
 
@@ -155,17 +174,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.daemonize {
         let stderr = File::create(format!("{}_stderr.log", args.logs_location)).unwrap();
+        let listener_port = listener.local_addr()?.port();
         log::info!("Writing bind port ({}) to stdout", listener_port);
         print!("{}", listener_port);
         io::stdout().flush().unwrap();
         let daemonize = Daemonize::new().stderr(stderr);
         daemonize.start()?;
     }
-
-    if let Err(e) = server.run().await {
-        log::error!("Server died due to {}", e);
-    }
-
-    main_chan.await?;
-    Ok(())
+    return tokio_main(args, listener);
 }

@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         String::from_utf8(server_result.stderr).unwrap_or("<no logs>".to_string())
     );
 
-    let server_port: u16 = String::from_utf8(server_result.stdout)?.parse::<u16>()?;
+    let mut server_port: u16 = String::from_utf8(server_result.stdout)?.parse::<u16>()?;
     log::info!("Got server port {}", server_port);
 
     let local_port = get_available_port()?;
