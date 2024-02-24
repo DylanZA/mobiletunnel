@@ -8,11 +8,15 @@ name = "libmobiletunnel"
 path = "src/lib/lib.rs"
 
 [[bin]]
-name = "client"
+name = "mobiletunnel"
+path = "src/bin/mobiletunnel.rs"
+
+[[bin]]
+name = "mobiletunnel_client"
 path = "src/bin/client.rs"
 
 [[bin]]
-name = "server"
+name = "mobiletunnel_server"
 path = "src/bin/server.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -21,8 +25,12 @@ clap = { version = "4.4.11", features = ["derive"] }
 log = { log = {features=["release_max_level_info"]} }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { features = ["compat", "codec"] }
-simple_logger = {}
+simple_logger = { features = ["stderr"]}
 bytes = {}
 futures = {}
 tokio-stream = {}
 rand = {}
+daemonize = {}
+libc = {}
+sysinfo = {}
+

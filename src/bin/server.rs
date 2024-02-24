@@ -17,11 +17,17 @@ Copyright 2024 Dylan Yudaken
 */
 
 use clap::Parser;
+use daemonize::Daemonize;
+use libc::{getuid, kill, SIGTERM};
 use libmobiletunnel::{reconnecting_stream, stream_multiplexer};
 use log;
 use simple_logger::SimpleLogger;
-use std::io;
+use std::env;
+use std::fs::File;
+use std::io::{self, Write};
 use std::net::{AddrParseError, IpAddr};
+use std::path::Path;
+use sysinfo::{get_current_pid, System};
 use tokio::net::TcpListener;
 
 #[derive(Parser, Debug)]
@@ -35,6 +41,13 @@ struct Args {
     pub target_port: u16,
     #[clap(long, required = true)]
     pub target_host: String,
+    #[clap(long, action)]
+    pub daemonize: bool,
+    #[clap(long, action)]
+    pub kill_old: bool,
+
+    #[clap(long, default_value = "/var/tmp/mobiletunnel")]
+    pub logs_location: String,
 }
 
 fn ipv6_stripped(host: &str) -> &str {
@@ -86,9 +99,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_sender.sender,
         stream_sender.receiver,
     )?;
+    if args.kill_old {
+        let mut sys = System::new_all();
+
+        // Prints each argument on a separate line
+        let process_name = env::args()
+            .next()
+            .ok_or("Unable to determine process name")?;
+        let process_file_name = Path::new(&process_name)
+            .file_name()
+            .map(|p| p.to_str())
+            .flatten()
+            .ok_or("Unable to determine process file name")?;
+        let our_pid = get_current_pid()?;
+        let mut our_uid = 0;
+        unsafe {
+            our_uid = getuid();
+        }
+        for (pid, process) in sys.processes() {
+            if pid == &our_pid {
+                continue;
+            }
+            if let Some(_) = process.thread_kind() {
+                // don't care about threads
+                continue;
+            }
+            match process.exe().and_then(|x| x.file_name()) {
+                None => continue,
+                Some(exe) => {
+                    let exe_str = exe
+                        .to_str()
+                        .map(|x| x.to_string().replace(" (deleted)", ""));
+                    match exe_str {
+                        None => continue,
+                        Some(exe_str_2) => {
+                            if exe_str_2 != process_file_name {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            match process.user_id() {
+                None => continue,
+                Some(uid) => {
+                    if **uid != our_uid {
+                        continue;
+                    }
+                }
+            }
+            log::info!("Killing {} ({})", pid, process.name());
+            let kill_res = process.kill();
+            log::info!("... result {}", kill_res);
+        }
+    }
+    if args.daemonize {
+        let stderr = File::create(format!("{}_stderr.log", args.logs_location)).unwrap();
+        log::info!("Writing bind port ({}) to stdout", listener_port);
+        print!("{}", listener_port);
+        io::stdout().flush().unwrap();
+        let daemonize = Daemonize::new().stderr(stderr);
+        daemonize.start()?;
+    }
+
     if let Err(e) = server.run().await {
         log::error!("Server died due to {}", e);
     }
+
     main_chan.await?;
     Ok(())
 }
