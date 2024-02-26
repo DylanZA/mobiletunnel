@@ -99,29 +99,26 @@ async fn main_channel(
     let runner_task = tokio::spawn(async move {
         let mut next_socket = None;
         loop {
-            match next_socket {
-                None => {
-                    next_socket = socket_rx.recv().await;
-                    log::info!("Received socket: {}", next_socket.is_some());
-                    if next_socket.is_some() {
-                        // drain the queue
-                        loop {
-                            match socket_rx.try_recv() {
-                                Ok(s) => {
-                                    next_socket = Some(s);
-                                }
-                                Err(_) => break,
-                            }
-                        }
+            if next_socket.is_none() {
+                next_socket = socket_rx.recv().await;
+                log::info!("Received socket: {}", next_socket.is_some());
+            }
+            // drain the queue
+            loop {
+                match socket_rx.try_recv() {
+                    Ok(s) => {
+                        log::info!("...dropped unused socket");
+                        next_socket = Some(s);
                     }
+                    Err(_) => break,
                 }
-                Some((stream, sockaddr)) => {
-                    log::info!("new stream from {}", sockaddr);
-                    next_socket =
-                        reconnecting_stream::run_stream(stream, &mut stream_state, &mut socket_rx)
-                            .await;
-                    log::info!("... done stream");
-                }
+            }
+            if let Some((stream, sockaddr)) = next_socket {
+                log::info!("new stream from {}", sockaddr);
+                next_socket =
+                    reconnecting_stream::run_stream(stream, &mut stream_state, &mut socket_rx)
+                        .await;
+                log::info!("... done stream");
             }
         }
     });
