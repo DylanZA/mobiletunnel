@@ -17,6 +17,7 @@ Copyright 2024 Dylan Yudaken
 */
 
 use bytes::{BufMut, BytesMut};
+use futures::channel::mpsc::Receiver;
 use futures::stream::StreamExt;
 use rand::Rng;
 use std::io;
@@ -306,13 +307,17 @@ fn parse(data: &[u8]) -> String {
     }
 }
 
-pub async fn run_stream(stream: TcpStream, state: &mut StreamState) {
+pub async fn run_stream<TInterrupt>(
+    stream: TcpStream,
+    state: &mut StreamState,
+    kill_stream_rx: &mut mpsc::Receiver<TInterrupt>,
+) -> Option<TInterrupt> {
     let (read_stream, mut write_stream) = stream.into_split();
     let initial_message = StreamCodecMessage::Hello(state.make_hello()).encode();
     log::debug!("sending {}", parse(&initial_message));
     if write_stream.write_all(&initial_message).await.is_err() {
         log::info!("Could not write hello");
-        return;
+        return None;
     }
 
     // use a channel and spawned task as I don't trust FramedRead's cancel safety
@@ -364,22 +369,30 @@ pub async fn run_stream(stream: TcpStream, state: &mut StreamState) {
         }
     });
 
-    if let Some(Some(StreamCodecMessage::Hello(hm))) = joined_rx.recv().await {
-        if let Some(other_id) = state.remote_id {
-            if other_id != hm.sender_id {
-                log::error!("Bad sender id");
-                return;
+    tokio::select! {
+        interrupt = kill_stream_rx.recv()  => {
+            log::info!("stream killed while waiting for hello, ending");
+            return interrupt;
+        },
+        msg = joined_rx.recv() => {
+            if let Some(Some(StreamCodecMessage::Hello(hm))) = msg {
+                if let Some(other_id) = state.remote_id {
+                    if other_id != hm.sender_id {
+                        log::error!("Bad sender id");
+                        return None;
+                    }
+                }
+                state.remote_id = Some(hm.sender_id);
+                if let Err(e) = state.ack(hm.sender_last_rx) {
+                    log::error!("Bad last rx {}", e);
+                    return None;
+                }
+            } else {
+                log::info!("First message not a hello");
+                return None;
             }
         }
-        state.remote_id = Some(hm.sender_id);
-        if let Err(e) = state.ack(hm.sender_last_rx) {
-            log::error!("Bad last rx {}", e);
-            return;
-        }
-    } else {
-        log::info!("First message not a hello");
-        return;
-    }
+    };
 
     // send anything we have in the queue:
     for msg in state.sent_unacked.iter() {
@@ -390,6 +403,10 @@ pub async fn run_stream(stream: TcpStream, state: &mut StreamState) {
 
     loop {
         tokio::select! {
+            interrupt = kill_stream_rx.recv()  => {
+                log::info!("stream killed while processing, ending");
+                return interrupt;
+            },
             app_rx = state.receiver.recv(), if !state.is_full() => {
                 match app_rx {
                     None => {
@@ -427,7 +444,7 @@ pub async fn run_stream(stream: TcpStream, state: &mut StreamState) {
                             StreamCodecMessage::Ack(a) => {
                                 if let Err(e) = state.ack(a) {
                                     log::error!("Bad ack {}", e);
-                                    return;
+                                    return None;
                                 }
                             },
                             StreamCodecMessage::Data(data) => {
@@ -445,4 +462,5 @@ pub async fn run_stream(stream: TcpStream, state: &mut StreamState) {
     tokio::join!(framed_reader_task);
     tokio::join!(framed_writer_task);
     log::debug!("Join done");
+    return None;
 }

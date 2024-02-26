@@ -18,6 +18,7 @@ Copyright 2024 Dylan Yudaken
 
 use clap::Parser;
 use daemonize::Daemonize;
+use futures::TryFutureExt;
 use libc::{getuid, kill, SIGTERM};
 use libmobiletunnel::{reconnecting_stream, stream_multiplexer};
 use log;
@@ -31,6 +32,7 @@ use std::path::Path;
 use sysinfo::{get_current_pid, System};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -67,14 +69,65 @@ fn parse_ip_from_uri_host(host: &str) -> Result<IpAddr, AddrParseError> {
 async fn main_channel(
     listener: TcpListener,
     stream_state_in: reconnecting_stream::StreamState,
-) -> io::Result<()> {
+) -> Result<(), io::Error> {
     let mut stream_state = stream_state_in;
-    loop {
-        let (stream, sockaddr) = listener.accept().await?;
-        log::info!("new stream from {}", sockaddr);
-        reconnecting_stream::run_stream(stream, &mut stream_state).await;
-        log::info!("... done stream");
-    }
+
+    let (socket_tx, mut socket_rx) = mpsc::channel(32);
+
+    let listener_task = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok(res) => {
+                    log::info!("New socket");
+                    match socket_tx.send(res).await {
+                        Ok(_) => {
+                            log::debug!("... sent");
+                        }
+                        Err(e) => {
+                            log::error!("... had error {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Error {} accepting, ending", e);
+                    return;
+                }
+            }
+        }
+    });
+
+    let runner_task = tokio::spawn(async move {
+        let mut next_socket = None;
+        loop {
+            match next_socket {
+                None => {
+                    next_socket = socket_rx.recv().await;
+                    log::info!("Received socket: {}", next_socket.is_some());
+                    if next_socket.is_some() {
+                        // drain the queue
+                        loop {
+                            match socket_rx.try_recv() {
+                                Ok(s) => {
+                                    next_socket = Some(s);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                Some((stream, sockaddr)) => {
+                    log::info!("new stream from {}", sockaddr);
+                    next_socket =
+                        reconnecting_stream::run_stream(stream, &mut stream_state, &mut socket_rx)
+                            .await;
+                    log::info!("... done stream");
+                }
+            }
+        }
+    });
+    listener_task.await?;
+    runner_task.await?;
+    return Ok(());
 }
 
 #[tokio::main]
@@ -82,12 +135,14 @@ async fn tokio_main(
     args: Args,
     std_listener: StdTcpListener,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
     let bind_address = parse_ip_from_uri_host(&args.bind_ip)?;
     let (stream_state, stream_sender) = reconnecting_stream::StreamState::new();
     let listener_port = listener.local_addr()?.port();
     log::info!("bound to {}:{}", bind_address, listener_port);
     let main_chan = tokio::spawn(main_channel(listener, stream_state));
+
     let mut server = stream_multiplexer::StreamMultiplexerServer::new(
         stream_multiplexer::StreamMultiplexerServerOptions {
             target_port: args.target_port,
@@ -100,8 +155,9 @@ async fn tokio_main(
     if let Err(e) = server.run().await {
         log::error!("Server died due to {}", e);
     }
-
-    main_chan.await?;
+    if let Err(e) = main_chan.await? {
+        log::error!("Main channel error {}", e);
+    }
     Ok(())
 }
 

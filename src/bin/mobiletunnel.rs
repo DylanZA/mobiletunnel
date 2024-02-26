@@ -43,8 +43,11 @@ struct Args {
     pub client_command: String,
     #[clap(long, default_value = "ssh")]
     pub ssh_base: String,
-    #[clap(long, default_value = "autossh -M 0")]
-    pub autossh_base: String,
+    #[clap(
+        long,
+        default_value = "ssh -o ServerAliveInterval=2 -o ServerAliveCountMax=2"
+    )]
+    pub reconnecting_ssh_base: String,
 }
 
 fn port_is_available(port: u16) -> bool {
@@ -93,27 +96,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // now run ssh and client
 
-    let mut autossh_command: Vec<String> = args
-        .autossh_base
+    let mut reconnecting_ssh_command: Vec<String> = args
+        .reconnecting_ssh_base
         .split(" ")
         .map(|x| x.to_string())
         .collect();
-    autossh_command.push("-T".to_string());
-    autossh_command.push(format!(
+    reconnecting_ssh_command.push(format!(
         "-L localhost:{}:localhost:{}",
         local_port, server_port
     ));
-    autossh_command.push(args.target_host.clone());
-    autossh_command.push("cat".to_string());
+    reconnecting_ssh_command.push(args.target_host.clone());
+    reconnecting_ssh_command.push("cat".to_string());
 
-    log::info!("Run auto ssh with {}", autossh_command.join(" "));
-    let autossh_prog = autossh_command
-        .first()
-        .ok_or("no autossh command?")?
-        .clone();
-    let mut auto_ssh_command_inst = Command::new(autossh_prog)
-        .args(autossh_command.into_iter().skip(1))
-        .spawn()?;
+    let mk_ssh =
+        |command: &Vec<String>| -> Result<std::process::Child, Box<dyn std::error::Error>> {
+            log::info!("Run reconncting ssh with {}", command.join(" "));
+            let reconnecting_ssh_prog = command
+                .first()
+                .ok_or("no reconnecting ssh command?")?
+                .clone();
+            return Ok(Command::new(reconnecting_ssh_prog)
+                .args(command.into_iter().skip(1))
+                .spawn()?);
+        };
+
+    let mut auto_ssh_command_inst = mk_ssh(&reconnecting_ssh_command.clone())?;
 
     let mut client_command: Vec<String> = args
         .client_command
@@ -124,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     client_command.push(format!("--port={}", local_port));
 
     log::info!("Run client with {}", client_command.join(" "));
-    let client_prog = client_command.first().ok_or("no autossh command?")?.clone();
+    let client_prog = client_command.first().ok_or("no client command?")?.clone();
     let mut client_command_inst = Command::new(client_prog)
         .args(client_command.into_iter().skip(1))
         .stdin(Stdio::null())
@@ -138,8 +145,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         if let Some(es) = auto_ssh_command_inst.try_wait()? {
-            log::info!("autossh died with {}", es);
-            break;
+            log::info!("reconnecting ssh died with {}, restarting", es);
+            auto_ssh_command_inst = mk_ssh(&reconnecting_ssh_command.clone())?;
+            continue;
         }
         std::thread::sleep(Duration::from_secs(2));
     }

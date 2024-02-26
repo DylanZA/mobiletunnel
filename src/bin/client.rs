@@ -17,13 +17,13 @@ Copyright 2024 Dylan Yudaken
 */
 
 use clap::Parser;
+use libmobiletunnel::{reconnecting_stream, stream_multiplexer};
 use log;
 use simple_logger::SimpleLogger;
 use std::net::{AddrParseError, IpAddr};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::Duration;
-
-use libmobiletunnel::{reconnecting_stream, stream_multiplexer};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -54,6 +54,7 @@ async fn main_channel(
     stream_state_in: reconnecting_stream::StreamState,
 ) -> Result<(), String> {
     let mut stream_state = stream_state_in;
+    let (_, mut end_rx) = mpsc::channel(1);
     loop {
         let stream = TcpStream::connect((addr, port)).await;
         match stream {
@@ -62,7 +63,7 @@ async fn main_channel(
             }
             Ok(stream) => {
                 log::info!("starting stream");
-                reconnecting_stream::run_stream(stream, &mut stream_state).await;
+                reconnecting_stream::run_stream::<()>(stream, &mut stream_state, &mut end_rx).await;
                 log::info!("... done stream");
             }
         };
