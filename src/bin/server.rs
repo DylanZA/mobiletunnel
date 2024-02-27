@@ -226,7 +226,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if args.daemonize {
-        let stderr = File::create(format!("{}_stderr.log", args.logs_location)).unwrap();
+        let username = env::var("USER").unwrap_or("nouser".to_string());
+        let our_pid = get_current_pid()?;
+        let stderr = File::create(format!(
+            "{}_{}_{}_stderr.log",
+            args.logs_location, username, our_pid
+        ))
+        .unwrap();
         let listener_port = listener.local_addr()?.port();
         log::info!("Writing bind port ({}) to stdout", listener_port);
         print!("{}", listener_port);
