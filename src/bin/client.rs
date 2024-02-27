@@ -54,7 +54,7 @@ async fn main_channel(
     stream_state_in: reconnecting_stream::StreamState,
 ) -> Result<(), String> {
     let mut stream_state = stream_state_in;
-    let (_, mut end_rx) = mpsc::channel(1);
+    let (tx_side, mut end_rx) = mpsc::channel(1);
     loop {
         let stream = TcpStream::connect((addr, port)).await;
         match stream {

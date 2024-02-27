@@ -331,7 +331,10 @@ pub async fn run_stream<TInterrupt>(
             match next {
                 Some(Ok(msg)) => {
                     log::debug!("Received {}", msg.to_string());
-                    joined_channel_tx.send(Some(msg)).await.unwrap()
+                    if let Err(e) = joined_channel_tx.send(Some(msg)).await {
+                        log::error!("channel seems to have died: {}", e);
+                        break;
+                    }
                 }
                 None => {
                     log::info!("tcp session closed for some reason");
