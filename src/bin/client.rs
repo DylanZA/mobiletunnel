@@ -24,6 +24,7 @@ use std::net::{AddrParseError, IpAddr};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -48,30 +49,6 @@ fn parse_ip_from_uri_host(host: &str) -> Result<IpAddr, AddrParseError> {
             .parse::<IpAddr>())
 }
 
-async fn main_channel(
-    addr: IpAddr,
-    port: u16,
-    stream_state_in: reconnecting_stream::StreamState,
-) -> Result<(), String> {
-    let mut stream_state = stream_state_in;
-    let (tx_side, mut end_rx) = mpsc::channel(1);
-    loop {
-        let stream = TcpStream::connect((addr, port)).await;
-        match stream {
-            Err(_) => {
-                log::debug!("Unable to connect, will try again in a bit");
-            }
-            Ok(stream) => {
-                log::info!("starting stream");
-                reconnecting_stream::run_stream::<()>(stream, &mut stream_state, &mut end_rx).await;
-                log::info!("... done stream");
-            }
-        };
-        reconnecting_stream::run_unconnected_stream(&mut stream_state, Duration::from_secs(1))
-            .await;
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     SimpleLogger::new()
@@ -83,7 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Running tunnel to {}:{}", args.bind_ip, args.port);
     let bind_address = parse_ip_from_uri_host(&args.bind_ip)?;
     let (stream_state, stream_sender) = reconnecting_stream::StreamState::new();
-    let main_chan = tokio::spawn(main_channel(bind_address.clone(), args.port, stream_state));
+    let interrupt = CancellationToken::new();
+    let main_chan = tokio::spawn(stream_state.run_client(
+        bind_address.clone(),
+        args.port,
+        interrupt.child_token(),
+    ));
     log::info!("bind to {}:{}", bind_address, args.listen_port);
     let mut multiplexer = stream_multiplexer::StreamMultiplexerClient::new(
         stream_multiplexer::StreamMultiplexerClientOptions {
@@ -94,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream_sender.receiver,
     )
     .await?;
-    multiplexer.run().await?;
+    multiplexer.run(interrupt.child_token()).await?;
     main_chan.await?;
     Ok(())
 }

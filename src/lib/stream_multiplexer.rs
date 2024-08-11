@@ -17,12 +17,16 @@ Copyright 2024 Dylan Yudaken
 */
 
 use std::collections::HashMap;
+use std::error;
+use std::fmt;
 use std::io;
 use std::str;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinError;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct OngoingStreamId(u64);
@@ -72,7 +76,7 @@ impl ChannelMessage {
         }
     }
 
-    fn parse(data: &[u8]) -> Result<Option<(ChannelMessage, usize)>, MyError> {
+    fn parse(data: &[u8]) -> Result<Option<(ChannelMessage, usize)>, MultiplexerError> {
         if data.len() < 13 {
             return Ok(None);
         }
@@ -212,11 +216,16 @@ async fn run_internal_stream(
     stream_id: OngoingStreamId,
     channel_tx: mpsc::Sender<ChannelMessage>,
     mut channel_rx: mpsc::Receiver<Option<ChannelMessage>>,
+    interrupt: CancellationToken,
 ) -> Result<(), io::Error> {
     let mut rx_bytes: [u8; 4096] = [0; 4096];
     loop {
         log::debug!("Running internal connection {}", stream_id.0);
         tokio::select! {
+            _ = interrupt.cancelled() => {
+                log::trace!("tcp stream interrupted, ending");
+                break;
+            },
             stream_read = stream.read(&mut rx_bytes) => {
                 match stream_read {
                     Err(e) => {
@@ -281,7 +290,56 @@ struct OngoingStreamState {
     into_stream_tx: mpsc::Sender<Option<ChannelMessage>>,
     join_handle: tokio::task::JoinHandle<()>,
 }
-type MyError = Box<dyn std::error::Error>;
+
+#[derive(Debug, Clone)]
+pub struct MultiplexerError {
+    msg: String,
+}
+
+impl From<&str> for MultiplexerError {
+    fn from(cause: &str) -> Self {
+        MultiplexerError {
+            msg: cause.to_string(),
+        }
+    }
+}
+
+impl From<std::io::Error> for MultiplexerError {
+    fn from(cause: std::io::Error) -> Self {
+        MultiplexerError {
+            msg: cause.to_string(),
+        }
+    }
+}
+
+impl<T> From<mpsc::error::SendError<T>> for MultiplexerError {
+    fn from(cause: mpsc::error::SendError<T>) -> Self {
+        MultiplexerError {
+            msg: format!("senderror: {}", cause),
+        }
+    }
+}
+
+impl From<JoinError> for MultiplexerError {
+    fn from(cause: JoinError) -> Self {
+        MultiplexerError {
+            msg: format!("join error: {}", cause),
+        }
+    }
+}
+
+impl fmt::Display for MultiplexerError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Error: {}", self.msg)
+    }
+}
+
+impl error::Error for MultiplexerError {
+    fn description(&self) -> &str {
+        &self.msg
+    }
+}
+
 struct ChannelMessageParser {
     buffer: Vec<u8>,
 }
@@ -299,7 +357,7 @@ impl ChannelMessageParser {
         }
     }
 
-    fn next(&mut self) -> Result<Option<ChannelMessage>, MyError> {
+    fn next(&mut self) -> Result<Option<ChannelMessage>, MultiplexerError> {
         match ChannelMessage::parse(&self.buffer)? {
             None => return Ok(None),
             Some((msg, to_drop)) => {
@@ -321,7 +379,7 @@ enum StreamFactory {
     Addr((String, u16)),
 }
 
-fn swallow_error<T: Into<MyError>>(e: T) -> Result<(), MyError> {
+fn swallow_error<T: Into<MultiplexerError>>(e: T) -> Result<(), MultiplexerError> {
     log::error!("Swallowed error {}", e.into());
     return Ok(());
 }
@@ -352,7 +410,7 @@ impl OngoingStreamTracker {
         }
     }
 
-    async fn data(&mut self, sd: DataMsg) -> Result<(), MyError> {
+    async fn data(&mut self, sd: DataMsg) -> Result<(), MultiplexerError> {
         let id = sd.stream_id.clone();
         if let Some(x) = self.streams.get_mut(&sd.stream_id) {
             if let Err(e) = x.into_stream_tx.send(Some(ChannelMessage::Data(sd))).await {
@@ -370,7 +428,8 @@ impl OngoingStreamTracker {
         &mut self,
         id: OngoingStreamId,
         conn_factory: StreamFactory,
-    ) -> Result<(), MyError> {
+        interrupt: CancellationToken,
+    ) -> Result<(), MultiplexerError> {
         if let Some(_) = self.streams.get_mut(&id) {
             log::error!("Already have a connection!?!?");
             return Err("Already had this connection id")?;
@@ -390,8 +449,14 @@ impl OngoingStreamTracker {
                     log::error!("Error connecting {}", x);
                 }
                 Ok(conn) => {
-                    if let Err(x) =
-                        run_internal_stream(conn, idc.clone(), to_channel_tx, from_channel_rx).await
+                    if let Err(x) = run_internal_stream(
+                        conn,
+                        idc.clone(),
+                        to_channel_tx,
+                        from_channel_rx,
+                        interrupt,
+                    )
+                    .await
                     {
                         log::error!("Error running stream {}", x);
                     }
@@ -417,6 +482,7 @@ pub struct StreamMultiplexerServer {
     parser: ChannelMessageParser,
     into_channel_tx: mpsc::Sender<Vec<u8>>,
     from_channel_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    interrupt: CancellationToken,
     streams: OngoingStreamTracker,
 }
 
@@ -425,17 +491,18 @@ impl StreamMultiplexerServer {
         options: StreamMultiplexerServerOptions,
         into_channel_tx: mpsc::Sender<Vec<u8>>,
         from_channel_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    ) -> Result<StreamMultiplexerServer, io::Error> {
+    ) -> Result<StreamMultiplexerServer, MultiplexerError> {
         return Ok(StreamMultiplexerServer {
             options: options,
             into_channel_tx,
             from_channel_rx,
+            interrupt: CancellationToken::new(),
             parser: ChannelMessageParser::new(),
             streams: OngoingStreamTracker::new(),
         });
     }
 
-    async fn process_channel_rx(&mut self, data: Vec<u8>) -> Result<(), MyError> {
+    async fn process_channel_rx(&mut self, data: Vec<u8>) -> Result<(), MultiplexerError> {
         self.parser.add(data);
         loop {
             match self.parser.next()? {
@@ -451,9 +518,10 @@ impl StreamMultiplexerServer {
                         self.options.target_port,
                     );
                     log::debug!("Server new connection {}", cid.0);
+                    let interrupt = self.interrupt.child_token();
                     if let Err(e) = self
                         .streams
-                        .new_stream(cid, StreamFactory::Addr(addr))
+                        .new_stream(cid, StreamFactory::Addr(addr), interrupt)
                         .await
                     {
                         log::error!("Unalbe to connect {}", e);
@@ -472,9 +540,14 @@ impl StreamMultiplexerServer {
         Ok(())
     }
 
-    pub async fn run(&mut self) -> Result<(), MyError> {
+    pub async fn run(&mut self, interrupt: CancellationToken) -> Result<(), MultiplexerError> {
         loop {
             tokio::select! {
+                _ = interrupt.cancelled() => {
+                    log::trace!("multiplexer client stopped");
+                    self.interrupt.cancel();
+                    return Ok(());
+                },
                 from_channel_rx = self.from_channel_rx.recv() => {
                     match from_channel_rx {
                         None => {
@@ -509,6 +582,7 @@ pub struct StreamMultiplexerClient {
     from_channel_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     parser: ChannelMessageParser,
     streams: OngoingStreamTracker,
+    pub port: u16,
 }
 
 impl StreamMultiplexerClient {
@@ -516,8 +590,9 @@ impl StreamMultiplexerClient {
         options: StreamMultiplexerClientOptions,
         tx: mpsc::Sender<Vec<u8>>,
         rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    ) -> Result<StreamMultiplexerClient, io::Error> {
+    ) -> Result<StreamMultiplexerClient, MultiplexerError> {
         let listen = TcpListener::bind((options.listen_host.clone(), options.listen_port)).await?;
+        let port = listen.local_addr()?.port();
         return Ok(StreamMultiplexerClient {
             options: options,
             listener: listen,
@@ -525,10 +600,11 @@ impl StreamMultiplexerClient {
             from_channel_rx: rx,
             parser: ChannelMessageParser::new(),
             streams: OngoingStreamTracker::new(),
+            port: port,
         });
     }
 
-    async fn process_channel_rx(&mut self, data: Vec<u8>) -> Result<(), MyError> {
+    async fn process_channel_rx(&mut self, data: Vec<u8>) -> Result<(), MultiplexerError> {
         self.parser.add(data);
         loop {
             match self.parser.next()? {
@@ -553,10 +629,14 @@ impl StreamMultiplexerClient {
         Ok(())
     }
 
-    pub async fn run(&mut self) -> Result<(), MyError> {
+    pub async fn run(&mut self, interrupt: CancellationToken) -> Result<(), MultiplexerError> {
         let mut stream_id: u64 = 1;
         loop {
             tokio::select! {
+                _ = interrupt.cancelled() => {
+                    log::trace!("multiplexer client stopped");
+                    return Ok(());
+                },
                 new_stream_res = self.listener.accept() => {
                     let (new_stream, new_stream_addr) = new_stream_res?;
                     log::info!("Got a new stream from {}", new_stream_addr);
@@ -565,7 +645,7 @@ impl StreamMultiplexerClient {
                     self.to_channel_tx.send(ChannelMessage::Connect(ConnectMsg {
                         stream_id: this_id.clone()
                     }).encode()).await?;
-                    self.streams.new_stream(this_id, StreamFactory::Stream(new_stream)).await?;
+                    self.streams.new_stream(this_id, StreamFactory::Stream(new_stream), interrupt.child_token()).await?;
                 },
                 from_channel_rx = self.from_channel_rx.recv() => {
                     match from_channel_rx {

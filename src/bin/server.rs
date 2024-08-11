@@ -33,6 +33,7 @@ use sysinfo::{get_current_pid, System};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -66,67 +67,6 @@ fn parse_ip_from_uri_host(host: &str) -> Result<IpAddr, AddrParseError> {
             .parse::<IpAddr>())
 }
 
-async fn main_channel(
-    listener: TcpListener,
-    stream_state_in: reconnecting_stream::StreamState,
-) -> Result<(), io::Error> {
-    let mut stream_state = stream_state_in;
-
-    let (socket_tx, mut socket_rx) = mpsc::channel(32);
-
-    let listener_task = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok(res) => {
-                    log::info!("New socket");
-                    match socket_tx.send(res).await {
-                        Ok(_) => {
-                            log::debug!("... sent");
-                        }
-                        Err(e) => {
-                            log::error!("... had error {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Error {} accepting, ending", e);
-                    return;
-                }
-            }
-        }
-    });
-
-    let runner_task = tokio::spawn(async move {
-        let mut next_socket = None;
-        loop {
-            if next_socket.is_none() {
-                next_socket = socket_rx.recv().await;
-                log::info!("Received socket: {}", next_socket.is_some());
-            }
-            // drain the queue
-            loop {
-                match socket_rx.try_recv() {
-                    Ok(s) => {
-                        log::info!("...dropped unused socket");
-                        next_socket = Some(s);
-                    }
-                    Err(_) => break,
-                }
-            }
-            if let Some((stream, sockaddr)) = next_socket {
-                log::info!("new stream from {}", sockaddr);
-                next_socket =
-                    reconnecting_stream::run_stream(stream, &mut stream_state, &mut socket_rx)
-                        .await;
-                log::info!("... done stream");
-            }
-        }
-    });
-    listener_task.await?;
-    runner_task.await?;
-    return Ok(());
-}
-
 #[tokio::main]
 async fn tokio_main(
     args: Args,
@@ -138,7 +78,8 @@ async fn tokio_main(
     let (stream_state, stream_sender) = reconnecting_stream::StreamState::new();
     let listener_port = listener.local_addr()?.port();
     log::info!("bound to {}:{}", bind_address, listener_port);
-    let main_chan = tokio::spawn(main_channel(listener, stream_state));
+    let interrupt = CancellationToken::new();
+    let main_chan = tokio::spawn(stream_state.run_server(listener, interrupt.child_token()));
 
     let mut server = stream_multiplexer::StreamMultiplexerServer::new(
         stream_multiplexer::StreamMultiplexerServerOptions {
@@ -148,8 +89,7 @@ async fn tokio_main(
         stream_sender.sender,
         stream_sender.receiver,
     )?;
-
-    if let Err(e) = server.run().await {
+    if let Err(e) = server.run(interrupt.child_token()).await {
         log::error!("Server died due to {}", e);
     }
     if let Err(e) = main_chan.await? {
@@ -168,11 +108,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Running tunnel on {}:{}", args.bind_ip, args.bind_port);
     let bind_address = parse_ip_from_uri_host(&args.bind_ip)?;
     let bind_sockaddr = (bind_address, args.bind_port);
-    let rt = Runtime::new()?;
+    let _ = Runtime::new()?;
     let listener = StdTcpListener::bind(bind_sockaddr)?;
 
     if args.kill_old {
-        let mut sys = System::new_all();
+        let sys = System::new_all();
 
         // Prints each argument on a separate line
         let process_name = env::args()
@@ -220,7 +160,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            log::info!("Killing {} ({})", pid, process.name());
+            log::info!(
+                "Killing {} ({})",
+                pid,
+                process.name().to_str().unwrap_or("<none>")
+            );
             let kill_res = process.kill();
             log::info!("... result {}", kill_res);
         }

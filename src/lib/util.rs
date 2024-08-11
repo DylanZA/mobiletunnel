@@ -16,6 +16,25 @@ along with MobileTunnel. If not, see <https://www.gnu.org/licenses/>.
 Copyright 2024 Dylan Yudaken
 */
 
-pub mod reconnecting_stream;
-pub mod stream_multiplexer;
-pub mod util;
+use std::fmt::Display;
+
+pub trait SwallowResultPrintErrExt {
+    fn swallow_or_print_err<S>(self, prefix: S) -> ()
+    where
+        S: Display;
+}
+
+impl<E> SwallowResultPrintErrExt for Result<(), E>
+where
+    E: ::std::fmt::Debug,
+{
+    fn swallow_or_print_err<S>(self, prefix: S) -> ()
+    where
+        S: Display,
+    {
+        if let Err(e) = self {
+            log::error!("{}: {:?}", prefix, e);
+        }
+        ()
+    }
+}
