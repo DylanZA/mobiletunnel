@@ -16,6 +16,8 @@ along with MobileTunnel. If not, see <https://www.gnu.org/licenses/>.
 Copyright 2024 Dylan Yudaken
 */
 
+pub mod client;
 pub mod reconnecting_stream;
+pub mod server;
 pub mod stream_multiplexer;
 pub mod util;

@@ -17,16 +17,16 @@ Copyright 2024 Dylan Yudaken
 */
 
 use clap::Parser;
+use futures::TryFutureExt;
 use log;
+use rand::distributions::Alphanumeric;
+use rand::Rng;
 use simple_logger::SimpleLogger;
+use std::path::Path;
 use std::process::Command;
-use std::{
-    fs::File,
-    io::{self, Write},
-    process::Stdio,
-    str::FromStr,
-};
 use std::{net::TcpListener, time::Duration};
+use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -39,15 +39,41 @@ struct Args {
     pub target_host: String,
     #[clap(long, default_value = "mobiletunnel_server")]
     pub server_command: String,
-    #[clap(long, default_value = "mobiletunnel_client")]
-    pub client_command: String,
     #[clap(long, default_value = "ssh")]
     pub ssh_base: String,
+    #[clap(long, default_value = "scp")]
+    pub scp_base: String,
     #[clap(
         long,
         default_value = "ssh -o ServerAliveInterval=2 -o ServerAliveCountMax=2"
     )]
     pub reconnecting_ssh_base: String,
+    #[clap(long)]
+    pub copy_self: bool,
+    #[clap(long, default_value = "")]
+    pub run_as_server: String,
+    /// note the below is probably a security hole
+    /// Someone could intercept the copy and place a bad executable there.
+    #[clap(long, default_value = "/tmp/")]
+    pub copy_self_base: String,
+}
+
+impl Args {
+    fn make_self_location(&self) -> Option<String> {
+        let s: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(15)
+            .map(char::from)
+            .collect();
+        let username: String = std::env::var("USER").unwrap_or("nouser".to_string());
+
+        return Some(
+            Path::new(&self.copy_self_base)
+                .join(format!("mobiletunnel_{}_{}", username, s))
+                .to_str()?
+                .to_string(),
+        );
+    }
 }
 
 fn port_is_available(port: u16) -> bool {
@@ -72,12 +98,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap();
     let args = Args::parse();
 
+    if args.run_as_server.len() > 0 {
+        log::info!(
+            "Short circuiting to run as the server using args {}",
+            args.run_as_server
+        );
+        let splitted = shellwords::split(&args.run_as_server)?;
+        let full_args = std::iter::once(
+            std::env::current_exe()?
+                .to_str()
+                .ok_or("cannot get current exe")?
+                .to_string(),
+        )
+        .chain(splitted);
+        let server_args = libmobiletunnel::server::Args::parse_from(full_args);
+        return libmobiletunnel::server::run_server(server_args);
+    }
+
     let mut ssh_command: Vec<String> = args.ssh_base.split(" ").map(|x| x.to_string()).collect();
     ssh_command.push(args.target_host.clone());
-    ssh_command.push(format!(
-        "{} --target-port {} --target-host localhost --bind-port 0 --daemonize --kill-old",
-        args.server_command, args.target_port
-    ));
+    let server_arg_string = format!(
+        "--target-port={} --target-host=localhost --bind-port=0 --daemonize --kill-old",
+        args.target_port
+    );
+    if args.copy_self {
+        let target_server_prog = args
+            .make_self_location()
+            .ok_or("cannot make a random location")?;
+        log::info!("Copying server to remote at {}", target_server_prog);
+        let mut scp_command: Vec<String> =
+            args.scp_base.split(" ").map(|x| x.to_string()).collect();
+        scp_command.push(
+            std::env::current_exe()?
+                .to_str()
+                .ok_or("cannot get current exe")?
+                .to_string(),
+        );
+        scp_command.push(format!("{}:{}", args.target_host, target_server_prog));
+        let scp_prog = scp_command.first().ok_or("no scp command?")?.clone();
+        let copy_server_result = Command::new(scp_prog)
+            .args(scp_command.into_iter().skip(1))
+            .output()?;
+        log::info!(
+            "Copy server: got logs: {}",
+            String::from_utf8(copy_server_result.stderr).unwrap_or("<no logs>".to_string())
+        );
+        ssh_command.push(format!(
+            "{} --local-port 0 --target-port 0 --target-host 0 --run-as-server=\"{}\"",
+            target_server_prog, server_arg_string
+        ));
+    } else {
+        ssh_command.push(format!("{} {}", args.server_command, server_arg_string));
+    }
+
     let server_prog = ssh_command.first().ok_or("no ssh command?")?.clone();
     let server_result = Command::new(server_prog)
         .args(ssh_command.into_iter().skip(1))
@@ -122,25 +195,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut auto_ssh_command_inst = mk_ssh(&reconnecting_ssh_command.clone())?;
 
-    let mut client_command: Vec<String> = args
-        .client_command
-        .split(" ")
-        .map(|x| x.to_string())
-        .collect();
-    client_command.push(format!("--listen-port={}", args.local_port));
-    client_command.push(format!("--port={}", local_port));
-
-    log::info!("Run client with {}", client_command.join(" "));
-    let client_prog = client_command.first().ok_or("no client command?")?.clone();
-    let mut client_command_inst = Command::new(client_prog)
-        .args(client_command.into_iter().skip(1))
-        .stdin(Stdio::null())
-        .spawn()?;
+    let client_args = libmobiletunnel::client::Args {
+        listen_port: args.local_port,
+        port: local_port,
+        bind_ip: "127.0.0.1".to_string(),
+    };
+    let client_cancel = CancellationToken::new();
+    let client_cancel_child = client_cancel.child_token();
+    let tokio_runtime = Runtime::new()?;
+    let client_run = tokio_runtime.spawn(async move {
+        libmobiletunnel::client::run_client(client_args, client_cancel_child)
+            .await
+            .map_err(|e| e.to_string())
+    });
 
     loop {
         log::debug!("looping");
         // todo event driven this
-        if let Some(es) = client_command_inst.try_wait()? {
+        if client_run.is_finished() {
             log::info!("client died");
             break;
         }
@@ -151,7 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::thread::sleep(Duration::from_secs(2));
     }
-    let _ = client_command_inst.kill();
+    client_cancel.cancel();
     let _ = auto_ssh_command_inst.kill();
     Ok(())
 }
