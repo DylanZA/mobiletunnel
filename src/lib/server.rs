@@ -53,6 +53,9 @@ pub struct Args {
 
     #[clap(long, default_value = "/var/tmp/mobiletunnel")]
     pub logs_location: String,
+
+    #[clap(long, default_value = None)]
+    pub kill_old_base: Option<String>,
 }
 
 fn ipv6_stripped(host: &str) -> &str {
@@ -108,20 +111,31 @@ pub fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.kill_old {
         let sys = System::new_all();
 
-        // Prints each argument on a separate line
-        let process_name = env::args()
-            .next()
-            .ok_or("Unable to determine process name")?;
-        let process_file_name = Path::new(&process_name)
-            .file_name()
-            .map(|p| p.to_str())
-            .flatten()
-            .ok_or("Unable to determine process file name")?;
+        let (match_str, match_whole) = match &args.kill_old_base {
+            None => {
+                let process_name = env::args()
+                    .next()
+                    .ok_or("Unable to determine process name")?;
+                let process_file_name = Path::new(&process_name)
+                    .file_name()
+                    .map(|p| p.to_str())
+                    .flatten()
+                    .ok_or("Unable to determine process file name")?
+                    .to_string();
+                (process_file_name, true)
+            }
+            Some(x) => (x.to_string(), false),
+        };
+
         let our_pid = get_current_pid()?;
         let mut our_uid = 0;
         unsafe {
             our_uid = getuid();
         }
+        let is_match = |x: &str| match match_whole {
+            true => x == match_str,
+            false => x.starts_with(&match_str),
+        };
         for (pid, process) in sys.processes() {
             if pid == &our_pid {
                 continue;
@@ -139,7 +153,7 @@ pub fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     match exe_str {
                         None => continue,
                         Some(exe_str_2) => {
-                            if exe_str_2 != process_file_name {
+                            if !is_match(&exe_str_2) {
                                 continue;
                             }
                         }

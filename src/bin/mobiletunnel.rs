@@ -59,20 +59,20 @@ struct Args {
 }
 
 impl Args {
-    fn make_self_location(&self) -> Option<String> {
+    fn make_self_location(&self) -> Option<(String, String)> {
+        let username: String = std::env::var("USER").unwrap_or("nouser".to_string());
+        let base = format!("mobiletunnel_{}", username);
         let s: String = rand::thread_rng()
             .sample_iter(&Alphanumeric)
             .take(15)
             .map(char::from)
             .collect();
-        let username: String = std::env::var("USER").unwrap_or("nouser".to_string());
 
-        return Some(
-            Path::new(&self.copy_self_base)
-                .join(format!("mobiletunnel_{}_{}", username, s))
-                .to_str()?
-                .to_string(),
-        );
+        let ret = Path::new(&self.copy_self_base)
+            .join(format!("{}_{}", base, s))
+            .to_str()?
+            .to_string();
+        return Some((ret, base));
     }
 }
 
@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.target_port
     );
     if args.copy_self {
-        let target_server_prog = args
+        let (target_server_prog, kill_base) = args
             .make_self_location()
             .ok_or("cannot make a random location")?;
         log::info!("Copying server to remote at {}", target_server_prog);
@@ -144,8 +144,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             String::from_utf8(copy_server_result.stderr).unwrap_or("<no logs>".to_string())
         );
         ssh_command.push(format!(
-            "{} --local-port 0 --target-port 0 --target-host 0 --run-as-server=\"{}\"",
-            target_server_prog, server_arg_string
+            "{} --local-port 0 --target-port 0 --target-host 0 --run-as-server=\"{} --kill-old-base={}\"",
+            target_server_prog, server_arg_string, kill_base
         ));
     } else {
         ssh_command.push(format!("{} {}", args.server_command, server_arg_string));
