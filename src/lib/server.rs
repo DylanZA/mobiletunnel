@@ -19,12 +19,16 @@ Copyright 2024 Dylan Yudaken
 use crate::{reconnecting_stream, stream_multiplexer};
 use clap::Parser;
 use daemonize::Daemonize;
+use futures::future;
+use futures::FutureExt;
 use futures::TryFutureExt;
+use futures::{future::Either, pin_mut};
 use libc::{getuid, kill, SIGTERM};
 use log;
 use simple_logger::SimpleLogger;
 use std::env;
 use std::fs::File;
+use std::future::Future;
 use std::io::{self, Write};
 use std::net::TcpListener as StdTcpListener;
 use std::net::{AddrParseError, IpAddr};
@@ -82,7 +86,7 @@ async fn tokio_main(
     let listener_port = listener.local_addr()?.port();
     log::info!("bound to {}:{}", bind_address, listener_port);
     let interrupt = CancellationToken::new();
-    let main_chan = tokio::spawn(stream_state.run_server(listener, interrupt.child_token()));
+    let mut main_chan = tokio::spawn(stream_state.run_server(listener, interrupt.child_token()));
 
     let mut server = stream_multiplexer::StreamMultiplexerServer::new(
         stream_multiplexer::StreamMultiplexerServerOptions {
@@ -92,12 +96,34 @@ async fn tokio_main(
         stream_sender.sender,
         stream_sender.receiver,
     )?;
-    if let Err(e) = server.run(interrupt.child_token()).await {
-        log::error!("Server died due to {}", e);
-    }
-    if let Err(e) = main_chan.await? {
-        log::error!("Main channel error {}", e);
-    }
+
+    future::join(
+        server.run(interrupt.child_token()).then(|res_server| {
+            interrupt.cancel();
+            if let Err(e) = res_server {
+                log::error!("Server died with error {}", e);
+            } else {
+                log::info!("Server finished cleanly");
+            }
+            return async { () };
+        }),
+        main_chan.then(|res_channel| {
+            interrupt.cancel();
+            match res_channel {
+                Err(je) => {
+                    log::error!("Main channel died with join error {}", je);
+                }
+                Ok(Err(e)) => {
+                    log::error!("Main channel died with error {}", e);
+                }
+                Ok(Ok(_)) => {
+                    log::info!("Main channel finished cleanly");
+                }
+            }
+            return async { () };
+        }),
+    )
+    .await;
     Ok(())
 }
 

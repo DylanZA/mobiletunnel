@@ -128,7 +128,7 @@ impl StreamState {
                 log::trace!("run_server: waiting for socket");
                 tokio::select! {
                     _ = listen_cancel.cancelled() => {
-                        log::info!("run_server: interrupting");
+                        log::info!("run_server: cancelled");
                         drop(socket_tx);
                         return;
                     },
@@ -160,6 +160,7 @@ impl StreamState {
             let mut next_socket = None;
             loop {
                 if runner_cancel.is_cancelled() {
+                    log::info!("runner cancelled");
                     break;
                 }
                 let mut sub_cancel = runner_cancel.child_token();
@@ -167,6 +168,7 @@ impl StreamState {
                 // wait for a socket:
                 tokio::select! {
                     _ = sub_cancel.cancelled() => {
+                        log::info!("runner sub-cancelled");
                         break;
                     },
                     n = socket_rx.recv() => {

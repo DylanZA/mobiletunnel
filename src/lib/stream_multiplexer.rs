@@ -544,14 +544,14 @@ impl StreamMultiplexerServer {
         loop {
             tokio::select! {
                 _ = interrupt.cancelled() => {
-                    log::trace!("multiplexer client stopped");
+                    log::trace!("multiplexer client stopped due to cancel");
                     self.interrupt.cancel();
                     return Ok(());
                 },
                 from_channel_rx = self.from_channel_rx.recv() => {
                     match from_channel_rx {
                         None => {
-                            return Err("rx channel died")?;
+                            return Err("rx channel died, ending server")?;
                         },
                         Some(data) => {
                             log::debug!("Server got {} bytes from channel", data.len());
