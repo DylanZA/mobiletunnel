@@ -35,6 +35,9 @@ pub struct Args {
     pub port: u16,
     #[clap(long, required = true)]
     pub listen_port: u16,
+
+    #[clap(long, default_value = "500000000")]
+    pub window: usize,
 }
 fn ipv6_stripped(host: &str) -> &str {
     let h = host.strip_prefix("[").unwrap_or(host);
@@ -54,7 +57,8 @@ pub async fn run_client(
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Running tunnel to {}:{}", args.bind_ip, args.port);
     let bind_address = parse_ip_from_uri_host(&args.bind_ip)?;
-    let (stream_state, stream_sender) = reconnecting_stream::StreamState::new();
+    let (stream_state, stream_sender) =
+        reconnecting_stream::StreamState::new(reconnecting_stream::StreamOptions::new(args.window));
     let main_chan = tokio::spawn(stream_state.run_client(
         bind_address.clone(),
         args.port,

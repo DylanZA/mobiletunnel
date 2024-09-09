@@ -68,6 +68,12 @@ pub trait DataProvider {
 }
 
 impl StreamOptions {
+    pub fn new(max_window: usize) -> StreamOptions {
+        StreamOptions {
+            max_window: max_window,
+        }
+    }
+
     pub fn default() -> StreamOptions {
         return StreamOptions {
             max_window: 1000 * 1000 * 30,
@@ -250,7 +256,7 @@ impl StreamState {
         return self.unacked_size() >= self.options.max_window;
     }
 
-    pub fn new() -> (StreamState, StreamSender) {
+    pub fn new(stream_options: StreamOptions) -> (StreamState, StreamSender) {
         let mut rng = rand::thread_rng();
 
         let (tx, rx) = mpsc::channel(1);
@@ -259,7 +265,7 @@ impl StreamState {
             StreamState {
                 id: rng.gen::<u64>(),
                 remote_id: None,
-                options: StreamOptions::default(),
+                options: stream_options,
                 sent_unacked: Vec::new(),
                 base_offset: 0,
                 received_seq: 0,
@@ -271,6 +277,10 @@ impl StreamState {
                 receiver: rx2,
             },
         )
+    }
+
+    pub fn default() -> (StreamState, StreamSender) {
+        StreamState::new(StreamOptions::default())
     }
 }
 

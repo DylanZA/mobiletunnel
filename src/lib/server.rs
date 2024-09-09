@@ -58,6 +58,9 @@ pub struct Args {
     #[clap(long, default_value = "/var/tmp/mobiletunnel")]
     pub logs_location: String,
 
+    #[clap(long, default_value = "500000000")]
+    pub window: usize,
+
     #[clap(long, default_value = None)]
     pub kill_old_base: Option<String>,
 }
@@ -82,7 +85,8 @@ async fn tokio_main(
     std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
     let bind_address = parse_ip_from_uri_host(&args.bind_ip)?;
-    let (stream_state, stream_sender) = reconnecting_stream::StreamState::new();
+    let (stream_state, stream_sender) =
+        reconnecting_stream::StreamState::new(reconnecting_stream::StreamOptions::new(args.window));
     let listener_port = listener.local_addr()?.port();
     log::info!("bound to {}:{}", bind_address, listener_port);
     let interrupt = CancellationToken::new();

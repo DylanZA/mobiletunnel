@@ -166,8 +166,8 @@ impl harness {
         let server_port = server_listener.local_addr().unwrap().port();
         let proxy = proxy::new(server_port).await?;
         log::trace!("Setting up streams...");
-        let (c, cs) = reconnecting_stream::StreamState::new();
-        let (s, ss) = reconnecting_stream::StreamState::new();
+        let (c, cs) = reconnecting_stream::StreamState::default();
+        let (s, ss) = reconnecting_stream::StreamState::default();
         let cancel_token = CancellationToken::new();
         log::trace!("Starting server...");
         let server_jh = tokio::spawn(s.run_server(server_listener, cancel_token.clone()));
@@ -236,8 +236,8 @@ impl harness {
     pub async fn stop(mut self) -> Result<(), Box<dyn std::error::Error>> {
         log::trace!("Shutting down test harness...");
         self.proxy.instructions_tx.send(Instruction::Close)?;
-        let (_, cs) = reconnecting_stream::StreamState::new();
-        let (_, ss) = reconnecting_stream::StreamState::new();
+        let (_, cs) = reconnecting_stream::StreamState::default();
+        let (_, ss) = reconnecting_stream::StreamState::default();
         self.client = cs;
         self.server = ss;
         self.interrupt.cancel();

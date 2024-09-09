@@ -56,6 +56,9 @@ struct Args {
     /// Someone could intercept the copy and place a bad executable there.
     #[clap(long, default_value = "/tmp/")]
     pub copy_self_base: String,
+
+    #[clap(long, default_value = "500000000")]
+    pub window: usize,
 }
 
 impl Args {
@@ -144,8 +147,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             String::from_utf8(copy_server_result.stderr).unwrap_or("<no logs>".to_string())
         );
         ssh_command.push(format!(
-            "{} --local-port 0 --target-port 0 --target-host 0 --run-as-server=\"{} --kill-old-base={}\"",
-            target_server_prog, server_arg_string, kill_base
+            "{} --local-port 0 --target-port 0 --target-host 0 --run-as-server=\"{} --kill-old-base={} --window={}\"",
+            target_server_prog, server_arg_string, kill_base, args.window
         ));
     } else {
         ssh_command.push(format!("{} {}", args.server_command, server_arg_string));
@@ -199,6 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen_port: args.local_port,
         port: local_port,
         bind_ip: "127.0.0.1".to_string(),
+        window: args.window,
     };
     let client_cancel = CancellationToken::new();
     let client_cancel_child = client_cancel.child_token();
