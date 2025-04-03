@@ -22,13 +22,10 @@ use daemonize::Daemonize;
 use futures::future;
 use futures::FutureExt;
 use futures::TryFutureExt;
-use futures::{future::Either, pin_mut};
-use libc::{getuid, kill, SIGTERM};
+use libc::getuid;
 use log;
-use simple_logger::SimpleLogger;
 use std::env;
 use std::fs::File;
-use std::future::Future;
 use std::io::{self, Write};
 use std::net::TcpListener as StdTcpListener;
 use std::net::{AddrParseError, IpAddr};
@@ -36,7 +33,6 @@ use std::path::Path;
 use sysinfo::{get_current_pid, System};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]
@@ -90,7 +86,7 @@ async fn tokio_main(
     let listener_port = listener.local_addr()?.port();
     log::info!("bound to {}:{}", bind_address, listener_port);
     let interrupt = CancellationToken::new();
-    let mut main_chan = tokio::spawn(stream_state.run_server(listener, interrupt.child_token()));
+    let main_chan = tokio::spawn(stream_state.run_server(listener, interrupt.child_token()));
 
     let mut server = stream_multiplexer::StreamMultiplexerServer::new(
         stream_multiplexer::StreamMultiplexerServerOptions {

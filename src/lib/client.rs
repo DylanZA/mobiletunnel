@@ -19,11 +19,7 @@ Copyright 2024 Dylan Yudaken
 use crate::{reconnecting_stream, stream_multiplexer};
 use clap::Parser;
 use log;
-use simple_logger::SimpleLogger;
 use std::net::{AddrParseError, IpAddr};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser, Debug)]

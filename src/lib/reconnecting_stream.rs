@@ -17,7 +17,6 @@ Copyright 2024 Dylan Yudaken
 */
 
 use bytes::{BufMut, BytesMut};
-use futures::channel::mpsc::Receiver;
 use futures::stream::StreamExt;
 use rand::Rng;
 use std::fmt::Display;
@@ -123,7 +122,7 @@ impl StreamState {
     pub async fn run_server(
         self,
         listener: TcpListener,
-        mut cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<(), io::Error> {
         let mut stream_state = self;
 

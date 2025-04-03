@@ -17,7 +17,6 @@ Copyright 2024 Dylan Yudaken
 */
 
 use clap::Parser;
-use futures::TryFutureExt;
 use log;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
@@ -79,18 +78,15 @@ impl Args {
     }
 }
 
-fn port_is_available(port: u16) -> bool {
-    match TcpListener::bind(("127.0.0.1", port)) {
-        Ok(_) => true,
-        Err(_) => false,
+fn get_available_port() -> Result<(TcpListener, u16), Box<dyn std::error::Error>> {
+    let mut rng = rand::thread_rng();
+    for _ in 0..100 {
+        let port = rng.gen_range(24000..32000);
+        let res = TcpListener::bind(("127.0.0.1", port))?;
+        let local_port = res.local_addr()?.port();
+        return Ok((res, local_port));
     }
-}
-
-fn get_available_port() -> Result<u16, Box<dyn std::error::Error>> {
-    let res = (24000..30000)
-        .find(|port| port_is_available(*port))
-        .ok_or("no free local port found?")?;
-    return Ok(res);
+    return Err("Failed to find a free port")?;
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -164,10 +160,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         String::from_utf8(server_result.stderr).unwrap_or("<no logs>".to_string())
     );
 
-    let mut server_port: u16 = String::from_utf8(server_result.stdout)?.parse::<u16>()?;
+    let server_port: u16 = String::from_utf8(server_result.stdout)?.parse::<u16>()?;
     log::info!("Got server port {}", server_port);
 
-    let local_port = get_available_port()?;
+    let (local_port_bind, local_port) = get_available_port()?;
     log::info!("Using local port of {}", local_port);
 
     // now run ssh and client
@@ -196,6 +192,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .spawn()?);
         };
 
+    // race condition here, have to race with mk_ssh to get a free local port
+    drop(local_port_bind);
     let mut auto_ssh_command_inst = mk_ssh(&reconnecting_ssh_command.clone())?;
 
     let client_args = libmobiletunnel::client::Args {
