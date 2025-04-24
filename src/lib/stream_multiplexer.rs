@@ -72,7 +72,6 @@ impl ChannelMessage {
             ChannelMessage::Data(d) => format!("Data({:?}) n={}", d.stream_id, d.to_send.len()),
             ChannelMessage::Disconnect(d) => format!("Disconnect({:?})", d.stream_id),
             ChannelMessage::Error(d) => format!("Error({:?}) {}", d.stream_id, d.message),
-            _ => format!("Unknown"),
         }
     }
 
@@ -267,10 +266,6 @@ async fn run_internal_stream(
                     }
                     None => {
                         log::debug!("Channel closed");
-                        break;
-                    },
-                    _ => {
-                        log::error!("Unexpected result");
                         break;
                     },
                 }

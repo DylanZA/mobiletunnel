@@ -6,7 +6,7 @@ use libmobiletunnel::reconnecting_stream;
 use libmobiletunnel::util::SwallowResultPrintErrExt as _;
 use tokio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -17,14 +17,14 @@ enum Instruction {
     Close,
 }
 
-struct proxy {
+struct Proxy {
     join_handle: JoinHandle<()>,
     pub port: u16,
     instructions_tx: mpsc::UnboundedSender<Instruction>,
     done_rx: mpsc::UnboundedReceiver<String>,
 }
 
-impl proxy {
+impl Proxy {
     async fn write_all(s: &mut TcpStream, buf: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = s.write_all(buf).await {
             return Err(e.into());
@@ -127,7 +127,7 @@ impl proxy {
         }
     }
 
-    async fn new(target_port: u16) -> Result<proxy, Box<dyn std::error::Error>> {
+    async fn new(target_port: u16) -> Result<Proxy, Box<dyn std::error::Error>> {
         let l = TcpListener::bind("127.0.0.1:0").await?;
         let (tx, rx) = mpsc::unbounded_channel();
         let (tx2, rx2) = mpsc::unbounded_channel();
@@ -141,7 +141,7 @@ impl proxy {
                 .swallow_or_print_err("sending error");
             return ();
         });
-        return Ok(proxy {
+        return Ok(Proxy {
             join_handle: jh,
             port: port,
             instructions_tx: tx,
@@ -150,21 +150,21 @@ impl proxy {
     }
 }
 
-struct harness {
+struct Harness {
     server_jh: JoinHandle<Result<(), io::Error>>,
     client_jh: JoinHandle<Result<(), String>>,
-    proxy: proxy,
+    proxy: Proxy,
     server: reconnecting_stream::StreamSender,
     client: reconnecting_stream::StreamSender,
     interrupt: CancellationToken,
 }
 
-impl harness {
-    async fn new() -> Result<harness, Box<dyn std::error::Error>> {
+impl Harness {
+    async fn new() -> Result<Harness, Box<dyn std::error::Error>> {
         let _ = env_logger::try_init();
         let server_listener = TcpListener::bind("127.0.0.1:0").await?;
         let server_port = server_listener.local_addr().unwrap().port();
-        let proxy = proxy::new(server_port).await?;
+        let proxy = Proxy::new(server_port).await?;
         log::trace!("Setting up streams...");
         let (c, cs) = reconnecting_stream::StreamState::default();
         let (s, ss) = reconnecting_stream::StreamState::default();
@@ -179,7 +179,7 @@ impl harness {
         ));
         log::trace!("... done harness init");
 
-        Ok(harness {
+        Ok(Harness {
             server_jh: server_jh,
             client_jh: client_jh,
             proxy: proxy,
@@ -191,7 +191,7 @@ impl harness {
 
     async fn do_recv(&mut self, server: bool, n: usize) -> Option<Vec<u8>> {
         let mut ret = vec![];
-        let mut receiver = if server {
+        let receiver = if server {
             &mut self.server.receiver
         } else {
             &mut self.client.receiver
@@ -254,7 +254,7 @@ impl harness {
 #[tokio::test()]
 async fn basic_test() {
     for _ in 0..10 {
-        let mut harness = harness::new().await.unwrap();
+        let mut harness = Harness::new().await.unwrap();
         harness
             .client
             .sender
@@ -278,7 +278,7 @@ async fn basic_test() {
 
 #[tokio::test()]
 async fn test_with_disconnect() {
-    let mut harness = harness::new().await.unwrap();
+    let mut harness = Harness::new().await.unwrap();
     harness
         .client
         .sender

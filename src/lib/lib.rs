@@ -17,7 +17,9 @@ Copyright 2024 Dylan Yudaken
 */
 
 pub mod client;
+pub mod process_helper;
 pub mod reconnecting_stream;
 pub mod server;
+pub mod server_check_port;
 pub mod stream_multiplexer;
 pub mod util;

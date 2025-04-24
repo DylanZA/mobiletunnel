@@ -162,7 +162,7 @@ impl StreamState {
 
         let runner_cancel = cancel.child_token();
         let runner_task = tokio::spawn(async move {
-            let mut next_socket = None;
+            let mut next_socket;
             loop {
                 if runner_cancel.is_cancelled() {
                     log::info!("runner cancelled");
@@ -188,7 +188,7 @@ impl StreamState {
                             log::info!("server: ...dropped unused socket");
                             next_socket = Some(s);
                         }
-                        Err(e) => {
+                        Err(_) => {
                             break;
                         }
                     }
@@ -517,13 +517,13 @@ pub async fn run_stream(
                     log::debug!("{}: Writing to channel {}", name, parse(&msg));
                     if write_stream.write_all(&msg).await.is_err() {
                         log::info!("{}: tcp write failed, closing session", name);
-                        joined_channel_tx_2.send(None); // ignore result
+                        let _ = joined_channel_tx_2.send(None); // ignore result
                         break;
                     }
                 }
                 None | Some(None) => {
                     log::info!("{}: tcp write session closed", name);
-                    joined_channel_tx_2.send(None); // ignore result
+                    let _ = joined_channel_tx_2.send(None); // ignore result
                     break;
                 }
             }

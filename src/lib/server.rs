@@ -42,12 +42,12 @@ pub struct Args {
     pub bind_ip: String,
     #[clap(long)]
     pub bind_port: u16,
-    #[clap(long, required = true)]
+    #[clap(long)]
     pub target_port: u16,
-    #[clap(long, required = true)]
+    #[clap(long)]
     pub target_host: String,
     #[clap(long, action)]
-    pub daemonize: bool,
+    pub daemonize: Option<String>,
     #[clap(long, action)]
     pub kill_old: bool,
 
@@ -154,7 +154,7 @@ pub fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let our_pid = get_current_pid()?;
-        let mut our_uid = 0;
+        let our_uid;
         unsafe {
             our_uid = getuid();
         }
@@ -203,7 +203,7 @@ pub fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             log::info!("... result {}", kill_res);
         }
     }
-    if args.daemonize {
+    if let Some(daemonize_path) = &args.daemonize {
         let username = env::var("USER").unwrap_or("nouser".to_string());
         let our_pid = get_current_pid()?;
         let stderr = File::create(format!(
@@ -212,10 +212,14 @@ pub fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         ))
         .unwrap();
         let listener_port = listener.local_addr()?.port();
-        log::info!("Writing bind port ({}) to stdout", listener_port);
+        log::info!(
+            "Writing bind port ({}) to stdout. pid path {}",
+            listener_port,
+            daemonize_path
+        );
         print!("{}", listener_port);
         io::stdout().flush().unwrap();
-        let daemonize = Daemonize::new().stderr(stderr);
+        let daemonize = Daemonize::new().stderr(stderr).pid_file(daemonize_path);
         daemonize.start()?;
     }
     return tokio_main(args, listener);
