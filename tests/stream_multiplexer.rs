@@ -1,6 +1,7 @@
 use bytes::BytesMut;
 use libmobiletunnel::stream_multiplexer;
 use libmobiletunnel::util::SwallowResultPrintErrExt as _;
+use std::time::Duration;
 use tokio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -74,10 +75,10 @@ impl Server {
 }
 
 struct Harness {
-    server: Server,
-    interrupt: CancellationToken,
+    _server: Server,
+    _interrupt: CancellationToken,
     client_port: u16,
-    tasks: Vec<JoinHandle<()>>,
+    _tasks: Vec<JoinHandle<()>>,
 }
 
 impl Harness {
@@ -139,10 +140,10 @@ impl Harness {
             return ();
         });
         Ok(Harness {
-            server: server,
-            interrupt: ct,
+            _server: server,
+            _interrupt: ct,
             client_port: client_port,
-            tasks: vec![
+            _tasks: vec![
                 from_client_shim_jh,
                 to_client_jh,
                 run_client_jh,
@@ -204,4 +205,137 @@ async fn many_test() {
     for j in jhs {
         assert!(j.await.unwrap());
     }
+}
+
+/// Server where the first connection floods data (never reads),
+/// and subsequent connections echo normally.
+struct BackpressureServer {
+    _join_handle: JoinHandle<()>,
+    pub port: u16,
+}
+
+impl BackpressureServer {
+    async fn new(ct: CancellationToken) -> Result<BackpressureServer, Box<dyn std::error::Error>> {
+        let l = TcpListener::bind("localhost:0").await?;
+        let port = l.local_addr()?.port();
+        let jh = tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                tokio::select! {
+                    _ = ct.cancelled() => break,
+                    t = l.accept() => {
+                        match t {
+                            Ok((mut stream, _)) => {
+                                let ct2 = ct.child_token();
+                                if first {
+                                    first = false;
+                                    // First connection: send lots of data, never read.
+                                    // Data flows server→client, creating backpressure
+                                    // on the CLIENT's per-stream channel when the test
+                                    // client doesn't read.
+                                    tokio::spawn(async move {
+                                        let data = vec![0u8; 8 * 1024 * 1024];
+                                        let _ = stream.write_all(&data).await;
+                                        ct2.cancelled().await;
+                                    });
+                                } else {
+                                    tokio::spawn(async move {
+                                        Server::run_one(stream, ct2).await.swallow_or_print_err("echo");
+                                    });
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        });
+        Ok(BackpressureServer {
+            _join_handle: jh,
+            port,
+        })
+    }
+}
+
+/// Test that a connection with TCP backpressure does not stall other connections.
+///
+/// The target server floods 8MB into connection 1 (server→client direction).
+/// The test client never reads from connection 1, so the client multiplexer's
+/// write_all blocks, filling the per-stream channel. With try_send, the client
+/// multiplexer drops connection 1 and stays responsive for connection 2.
+///
+/// The flood travels server→client via from_stream_rx (cap 16), NOT through
+/// from_channel_rx which handles connection 2's CONNECT+DATA. This avoids
+/// pipeline congestion that would make the test timing-dependent.
+#[tokio::test()]
+async fn backpressure_no_stall_test() {
+    let _ = env_logger::try_init();
+    let ct = CancellationToken::new();
+
+    let server = BackpressureServer::new(ct.child_token()).await.unwrap();
+
+    let (from_client_tx, from_client) = mpsc::channel(2);
+    let (to_client, to_client_rx) = mpsc::channel(2);
+    let (to_client_shim, _to_client_jh) = Harness::shim(to_client_rx);
+    let (from_client_shim, _from_client_shim_jh) = Harness::shim(from_client);
+    let mut clientm = stream_multiplexer::StreamMultiplexerClient::new(
+        stream_multiplexer::StreamMultiplexerClientOptions {
+            listen_port: 0,
+            listen_host: "localhost".to_string(),
+        },
+        from_client_tx,
+        to_client_shim,
+    )
+    .await
+    .unwrap();
+    let mut serverm = stream_multiplexer::StreamMultiplexerServer::new(
+        stream_multiplexer::StreamMultiplexerServerOptions {
+            target_port: server.port,
+            target_address: "localhost".to_string(),
+        },
+        to_client,
+        from_client_shim,
+    )
+    .unwrap();
+    let client_port = clientm.port;
+    let ct2 = ct.child_token();
+    tokio::spawn(async move { let _ = clientm.run(ct2).await; });
+    let ct3 = ct.child_token();
+    tokio::spawn(async move { serverm.run(ct3).await.swallow_or_print_err("mux"); });
+
+    // Connection 1: open but never read. The BackpressureServer sends 8MB
+    // into this connection. Data flows: server target → server mux →
+    // pipeline → client mux → per-stream channel → write_all to test
+    // client TCP. Since we never read, TCP buffers fill, write_all blocks,
+    // channel fills, try_send drops the connection.
+    let port1 = client_port;
+    tokio::spawn(async move {
+        if let Ok(c) = TcpStream::connect(format!("localhost:{}", port1)).await {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(c);
+        }
+    });
+
+    // Wait for the flood to propagate and fill the per-stream channel.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Connection 2: echo through the same multiplexer. Connection 2's
+    // CONNECT+DATA travel client→server via from_channel_rx, which is NOT
+    // congested (the flood goes server→client). Without try_send, this
+    // hangs because the client multiplexer is blocked on send().await.
+    let port2 = client_port;
+    let result = tokio::time::timeout(Duration::from_secs(5), async move {
+        let mut c = TcpStream::connect(format!("localhost:{}", port2)).await.unwrap();
+        c.write_all(b"hello").await.unwrap();
+        let mut buf = vec![0u8; 5];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "Connection 2 stalled — backpressure on connection 1 blocked the multiplexer"
+    );
+    ct.cancel();
 }

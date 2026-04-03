@@ -21,7 +21,7 @@ use clap::Parser;
 use daemonize::Daemonize;
 use futures::future;
 use futures::FutureExt;
-use futures::TryFutureExt;
+
 use libc::getuid;
 use log;
 use std::env;

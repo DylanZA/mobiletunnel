@@ -211,72 +211,133 @@ pub struct StreamMultiplexerServerOptions {
 }
 
 async fn run_internal_stream(
-    mut stream: TcpStream,
+    stream: TcpStream,
     stream_id: OngoingStreamId,
     channel_tx: mpsc::Sender<ChannelMessage>,
     mut channel_rx: mpsc::Receiver<Option<ChannelMessage>>,
     interrupt: CancellationToken,
 ) -> Result<(), io::Error> {
-    let mut rx_bytes: [u8; 4096] = [0; 4096];
-    loop {
-        log::debug!("Running internal connection {}", stream_id.0);
-        tokio::select! {
-            _ = interrupt.cancelled() => {
-                log::trace!("tcp stream interrupted, ending");
-                break;
-            },
-            stream_read = stream.read(&mut rx_bytes) => {
-                match stream_read {
-                    Err(e) => {
-                        log::debug!("Error reading from tcp stream {}", e);
-                        if let io::ErrorKind::Interrupted = e.kind() {
-                            continue;
+    let (mut read_half, mut write_half) = stream.into_split();
+    let done = CancellationToken::new();
+
+    // Write task: drains channel_rx and writes to TCP independently.
+    // A slow write_all no longer blocks channel consumption or TCP reads.
+    let write_done = done.clone();
+    let write_done2 = done.clone();
+    let write_interrupt = interrupt.clone();
+    let write_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = write_done.cancelled() => {
+                    log::trace!("write task cancelled");
+                    break;
+                },
+                _ = write_interrupt.cancelled() => {
+                    log::trace!("write task interrupted");
+                    break;
+                },
+                msg = channel_rx.recv() => {
+                    match msg.flatten() {
+                        Some(ChannelMessage::Data(sd)) => {
+                            log::debug!("Got {} bytes from app, sending to TcpStream", sd.to_send.len());
+                            // Select on cancellation alongside write_all so we
+                            // don't get stuck if the target stops reading.
+                            tokio::select! {
+                                _ = write_done2.cancelled() => {
+                                    log::debug!("write cancelled during write_all");
+                                    break;
+                                },
+                                result = write_half.write_all(&sd.to_send) => {
+                                    if let Err(e) = result {
+                                        log::debug!("Error writing to tcp stream: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
                         }
-                        return Err(e);
-                    },
-                    Ok(n) => {
-                        let vec = rx_bytes[..n].to_vec();
-                        if n == 0 {
-                            log::debug!("Read eof from tcp stream");
+                        Some(ChannelMessage::Disconnect(_)) => {
+                            log::debug!("disconnect!");
                             break;
                         }
-                        log::debug!("Read {} bytes from TcpStream, sending to app", vec.len());
-                        channel_tx.send(ChannelMessage::Data(DataMsg {stream_id: stream_id.clone(), to_send: vec})).await.map_err(|_| io::Error::new(io::ErrorKind::Other, "sending app data"))?;
+                        Some(ChannelMessage::Error(_)) => {
+                            log::debug!("error!");
+                            break;
+                        }
+                        Some(ChannelMessage::Connect(_)) => {
+                            log::error!("Weird connect");
+                            break;
+                        }
+                        None => {
+                            log::debug!("Channel closed");
+                            break;
+                        }
                     }
-                }
-            },
-            channel_rx_msg = channel_rx.recv() => {
-                log::debug!("internal connection got some message!");
-                match channel_rx_msg.flatten() {
-                    Some(ChannelMessage::Connect(_)) => {
-                        log::error!("Weird connect");
-                        break;
-                    },
-                    Some(ChannelMessage::Disconnect(_)) => {
-                        log::debug!("disconnect!");
-                        break;
-                    },
-                    Some(ChannelMessage::Error(_)) => {
-                        log::debug!("error!");
-                        break;
-                    }
-                    Some(ChannelMessage::Data(sd)) => {
-                        log::debug!("Got {} bytes from app, sending to TcpStream", sd.to_send.len());
-                        stream.write_all(&sd.to_send).await?;
-                    }
-                    None => {
-                        log::debug!("Channel closed");
-                        break;
-                    },
                 }
             }
         }
+        let _ = write_half.shutdown().await;
+    });
+
+    // Read task: reads from TCP and sends to multiplexer.
+    let read_done = done.clone();
+    let read_interrupt = interrupt.clone();
+    let sid = stream_id.clone();
+    let read_task = tokio::spawn(async move {
+        let mut rx_bytes = [0u8; 4096];
+        loop {
+            tokio::select! {
+                _ = read_done.cancelled() => {
+                    log::trace!("read task cancelled");
+                    break;
+                },
+                _ = read_interrupt.cancelled() => {
+                    log::trace!("read task interrupted");
+                    break;
+                },
+                stream_read = read_half.read(&mut rx_bytes) => {
+                    match stream_read {
+                        Err(e) => {
+                            log::debug!("Error reading from tcp stream {}", e);
+                            if e.kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            break;
+                        }
+                        Ok(0) => {
+                            log::debug!("Read eof from tcp stream");
+                            break;
+                        }
+                        Ok(n) => {
+                            let vec = rx_bytes[..n].to_vec();
+                            log::debug!("Read {} bytes from TcpStream, sending to app", vec.len());
+                            if channel_tx.send(ChannelMessage::Data(DataMsg {
+                                stream_id: sid.clone(),
+                                to_send: vec,
+                            })).await.is_err() {
+                                log::debug!("channel_tx send failed, ending read task");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Ensure sub-tasks are cancelled when this function exits for any reason
+    // (including abort). drop_guard cancels `done` when dropped.
+    let _drop_guard = done.drop_guard();
+
+    // When either task finishes, the drop_guard cancels the other.
+    tokio::select! {
+        _ = write_task => {
+            log::debug!("Write task finished for {}", stream_id.0);
+        }
+        _ = read_task => {
+            log::debug!("Read task finished for {}", stream_id.0);
+        }
     }
     log::debug!("Done internal connection {}", stream_id.0);
-    match stream.shutdown().await {
-        Ok(_) => log::debug!("Shutdown connection ok {}", stream_id.0),
-        Err(e) => log::debug!("Shutdown connection {} had error {}", stream_id.0, e),
-    }
     Ok(())
 }
 
@@ -390,24 +451,28 @@ impl OngoingStreamTracker {
     }
 
     async fn remove(&mut self, id: &OngoingStreamId) {
-        match self.streams.remove(&id) {
-            None => (),
-            Some(x) => {
-                let _ = x.into_stream_tx.send(None).await.or_else(swallow_error);
-                log::debug!("Start waiting for join handle");
-                let _ = x.join_handle.await.or_else(swallow_error);
-                log::debug!("... done waiting for join handle");
-            }
+        if let Some(x) = self.streams.remove(&id) {
+            // Don't use send(None).await — the channel may be full (which is
+            // why we're removing this stream), so it would block forever.
+            // abort() is sufficient: it cancels the task and drops resources.
+            x.join_handle.abort();
+            log::debug!("Aborted stream task for {:?}", id);
         }
     }
 
     async fn data(&mut self, sd: DataMsg) -> Result<(), MultiplexerError> {
         let id = sd.stream_id.clone();
         if let Some(x) = self.streams.get_mut(&sd.stream_id) {
-            if let Err(e) = x.into_stream_tx.send(Some(ChannelMessage::Data(sd))).await {
-                log::debug!("Error sending data to connection {}", e);
-                // must be dead
-                self.remove(&id).await;
+            match x.into_stream_tx.try_send(Some(ChannelMessage::Data(sd))) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!("Stream {:?} channel full, dropping connection", id);
+                    self.remove(&id).await;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    log::debug!("Stream {:?} channel closed, removing", id);
+                    self.remove(&id).await;
+                }
             }
         } else {
             log::debug!("Got message for {:?} but it is not running", &sd.stream_id);
@@ -427,7 +492,7 @@ impl OngoingStreamTracker {
         }
 
         let to_channel_tx = self.to_channel_tx.clone();
-        let (into_stream_tx, from_channel_rx) = mpsc::channel(16);
+        let (into_stream_tx, from_channel_rx) = mpsc::channel(64);
         let idc = id.clone();
         let jh = tokio::spawn(async move {
             let to_channel_tx_2 = to_channel_tx.clone();
@@ -566,7 +631,7 @@ impl StreamMultiplexerServer {
 }
 
 pub struct StreamMultiplexerClient {
-    options: StreamMultiplexerClientOptions,
+    _options: StreamMultiplexerClientOptions,
     listener: TcpListener,
     to_channel_tx: mpsc::Sender<Vec<u8>>,
     from_channel_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -584,7 +649,7 @@ impl StreamMultiplexerClient {
         let listen = TcpListener::bind((options.listen_host.clone(), options.listen_port)).await?;
         let port = listen.local_addr()?.port();
         return Ok(StreamMultiplexerClient {
-            options: options,
+            _options: options,
             listener: listen,
             to_channel_tx: tx,
             from_channel_rx: rx,

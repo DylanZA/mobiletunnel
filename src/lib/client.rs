@@ -71,6 +71,6 @@ pub async fn run_client(
     )
     .await?;
     multiplexer.run(interrupt.child_token()).await?;
-    main_chan.await?;
+    let _ = main_chan.await?;
     Ok(())
 }

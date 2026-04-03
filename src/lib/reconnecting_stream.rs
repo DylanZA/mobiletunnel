@@ -258,7 +258,7 @@ impl StreamState {
     pub fn new(stream_options: StreamOptions) -> (StreamState, StreamSender) {
         let mut rng = rand::thread_rng();
 
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(16);
         let (tx2, rx2) = mpsc::unbounded_channel();
         (
             StreamState {
@@ -391,7 +391,7 @@ impl Decoder for StreamCodec {
         match StreamCodecMessage::parse(&self.name, buf)? {
             None => Ok(None),
             Some((msg, skip)) => {
-                buf.split_to(skip);
+                let _ = buf.split_to(skip);
                 return Ok(Some(msg));
             }
         }
@@ -627,8 +627,8 @@ pub async fn run_stream(
     }
     let _ = writer_tx.send(None);
     let _ = joined_channel_tx_3.send(None);
-    tokio::join!(framed_reader_task);
-    tokio::join!(framed_writer_task);
+    let _ = tokio::join!(framed_reader_task);
+    let _ = tokio::join!(framed_writer_task);
     log::debug!("Join done");
     return;
 }
