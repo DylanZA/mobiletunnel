@@ -560,9 +560,10 @@ pub async fn run_stream(
 
     // send anything we have in the queue:
     for msg in state.sent_unacked.iter() {
-        writer_tx
-            .send(Some(StreamCodecMessage::Data(msg.clone()).encode()))
-            .unwrap();
+        if let Err(e) = writer_tx.send(Some(StreamCodecMessage::Data(msg.clone()).encode())) {
+            log::error!("{}: writer channel closed while resending queued data: {}", name, e);
+            return;
+        }
     }
 
     loop {
@@ -624,8 +625,8 @@ pub async fn run_stream(
             }
         };
     }
-    writer_tx.send(None);
-    joined_channel_tx_3.send(None);
+    let _ = writer_tx.send(None);
+    let _ = joined_channel_tx_3.send(None);
     tokio::join!(framed_reader_task);
     tokio::join!(framed_writer_task);
     log::debug!("Join done");

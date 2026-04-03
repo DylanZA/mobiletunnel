@@ -22,7 +22,7 @@ impl Server {
             let mut b = BytesMut::with_capacity(8128);
             tokio::select! {
                 _ = l.read_buf(&mut b) => {
-                    l.write(&b[..]).await?;
+                    l.write_all(&b[..]).await?;
                 },
                 _ = ct.cancelled() => {
                     break;
@@ -175,6 +175,22 @@ async fn test_one(idx: usize, port: u16) -> Result<bool, ()> {
     c.read_exact(&mut buffer).await.map_err(|_| ())?;
     log::trace!("{}: read...", idx);
     return Ok(b"hello".to_vec() == buffer);
+}
+
+#[tokio::test()]
+async fn large_data_test() {
+    let harness = Harness::new().await.unwrap();
+    let mut c = TcpStream::connect(format!("localhost:{}", harness.client_port))
+        .await
+        .unwrap();
+
+    // 64KB deterministic payload - large enough to span multiple TCP reads/frames
+    let payload: Vec<u8> = (0..65536).map(|i| (i % 251) as u8).collect();
+    c.write_all(&payload).await.unwrap();
+
+    let mut buffer = vec![0u8; payload.len()];
+    c.read_exact(&mut buffer).await.unwrap();
+    assert_eq!(buffer, payload);
 }
 
 #[tokio::test()]

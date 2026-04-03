@@ -84,15 +84,15 @@ impl ChannelMessage {
         let connection_id_part: [u8; 8] = header[5..13].try_into().unwrap();
         let type_part: u8 = header[0];
         let len: usize = u32::from_le_bytes(len_part).try_into().unwrap();
-        if len < 8 {
+        if len < 13 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "Everything should have a connect ion id so far",
+                "Frame too small: minimum is 13 bytes",
             ))?;
         }
         let connection_id = OngoingStreamId(u64::from_le_bytes(connection_id_part));
         let frame_size = len;
-        if frame_size < data.len() {
+        if frame_size > data.len() {
             log::debug!("frame_size {} data len {}", frame_size, data.len());
             return Ok(None);
         }
@@ -262,7 +262,7 @@ async fn run_internal_stream(
                     }
                     Some(ChannelMessage::Data(sd)) => {
                         log::debug!("Got {} bytes from app, sending to TcpStream", sd.to_send.len());
-                        stream.write(&sd.to_send).await?;
+                        stream.write_all(&sd.to_send).await?;
                     }
                     None => {
                         log::debug!("Channel closed");
@@ -393,13 +393,9 @@ impl OngoingStreamTracker {
         match self.streams.remove(&id) {
             None => (),
             Some(x) => {
-                x.into_stream_tx
-                    .send(None)
-                    .await
-                    .or_else(swallow_error)
-                    .unwrap(); // tell the stream to close
+                let _ = x.into_stream_tx.send(None).await.or_else(swallow_error);
                 log::debug!("Start waiting for join handle");
-                x.join_handle.await.or_else(swallow_error).unwrap();
+                let _ = x.join_handle.await.or_else(swallow_error);
                 log::debug!("... done waiting for join handle");
             }
         }
@@ -457,11 +453,10 @@ impl OngoingStreamTracker {
                     }
                 }
             };
-            to_channel_tx_2
+            let _ = to_channel_tx_2
                 .send(ChannelMessage::Disconnect(DisconnectMsg { stream_id: idc }))
                 .await
-                .or_else(swallow_error)
-                .unwrap();
+                .or_else(swallow_error);
         });
         let state = OngoingStreamState {
             into_stream_tx,
@@ -667,5 +662,136 @@ impl StreamMultiplexerClient {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sid(id: u64) -> OngoingStreamId {
+        OngoingStreamId(id)
+    }
+
+    #[test]
+    fn test_roundtrip_connect() {
+        let msg = ChannelMessage::Connect(ConnectMsg { stream_id: sid(42) });
+        let encoded = msg.encode();
+        let parsed = ChannelMessage::parse(&encoded).unwrap().unwrap();
+        assert_eq!(parsed.1, encoded.len());
+        assert_eq!(parsed.0, msg);
+    }
+
+    #[test]
+    fn test_roundtrip_disconnect() {
+        let msg = ChannelMessage::Disconnect(DisconnectMsg { stream_id: sid(99) });
+        let encoded = msg.encode();
+        let parsed = ChannelMessage::parse(&encoded).unwrap().unwrap();
+        assert_eq!(parsed.1, encoded.len());
+        assert_eq!(parsed.0, msg);
+    }
+
+    #[test]
+    fn test_roundtrip_data() {
+        let msg = ChannelMessage::Data(DataMsg {
+            stream_id: sid(7),
+            to_send: b"hello world".to_vec(),
+        });
+        let encoded = msg.encode();
+        let parsed = ChannelMessage::parse(&encoded).unwrap().unwrap();
+        assert_eq!(parsed.1, encoded.len());
+        assert_eq!(parsed.0, msg);
+    }
+
+    #[test]
+    fn test_roundtrip_error() {
+        let msg = ChannelMessage::Error(ErrorMsg {
+            stream_id: sid(3),
+            message: "something broke".to_string(),
+        });
+        let encoded = msg.encode();
+        let parsed = ChannelMessage::parse(&encoded).unwrap().unwrap();
+        assert_eq!(parsed.1, encoded.len());
+        assert_eq!(parsed.0, msg);
+    }
+
+    #[test]
+    fn test_parse_multiple_frames() {
+        let msg1 = ChannelMessage::Connect(ConnectMsg { stream_id: sid(1) });
+        let msg2 = ChannelMessage::Data(DataMsg {
+            stream_id: sid(2),
+            to_send: b"payload".to_vec(),
+        });
+        let mut buf = msg1.encode();
+        buf.extend(msg2.encode());
+
+        let (parsed1, consumed1) = ChannelMessage::parse(&buf).unwrap().unwrap();
+        assert_eq!(parsed1, msg1);
+
+        let (parsed2, consumed2) = ChannelMessage::parse(&buf[consumed1..]).unwrap().unwrap();
+        assert_eq!(parsed2, msg2);
+        assert_eq!(consumed1 + consumed2, buf.len());
+    }
+
+    #[test]
+    fn test_parse_incomplete_data_frame() {
+        let msg = ChannelMessage::Data(DataMsg {
+            stream_id: sid(5),
+            to_send: b"some data here".to_vec(),
+        });
+        let encoded = msg.encode();
+        let truncated = &encoded[..encoded.len() - 1];
+        assert!(ChannelMessage::parse(truncated).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_incomplete_header() {
+        assert!(ChannelMessage::parse(&[1, 0, 0]).unwrap().is_none());
+        assert!(ChannelMessage::parse(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_invalid_small_len() {
+        // len=5 is below both old (8) and new (13) thresholds
+        let mut buf = vec![CONNECT_MSG_ID];
+        buf.extend_from_slice(&5u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        assert!(ChannelMessage::parse(&buf).is_err());
+    }
+
+    #[test]
+    fn test_parse_len_10_is_invalid() {
+        // len=10 is between old threshold (8) and new threshold (13).
+        // With the old `len < 8` check, this would pass validation and
+        // then panic on `data[13..10]`. With `len < 13`, it correctly
+        // returns an error.
+        let mut buf = vec![CONNECT_MSG_ID];
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        assert!(ChannelMessage::parse(&buf).is_err());
+    }
+
+    #[test]
+    fn test_channel_message_parser_streaming() {
+        let msg1 = ChannelMessage::Data(DataMsg {
+            stream_id: sid(1),
+            to_send: b"first".to_vec(),
+        });
+        let msg2 = ChannelMessage::Data(DataMsg {
+            stream_id: sid(2),
+            to_send: b"second".to_vec(),
+        });
+        let mut combined = msg1.encode();
+        combined.extend(msg2.encode());
+
+        let mut parser = ChannelMessageParser::new();
+        for byte in combined {
+            parser.add(vec![byte]);
+        }
+        let parsed1 = parser.next().unwrap().unwrap();
+        assert_eq!(parsed1, msg1);
+        let parsed2 = parser.next().unwrap().unwrap();
+        assert_eq!(parsed2, msg2);
+        assert!(parser.next().unwrap().is_none());
     }
 }
