@@ -367,7 +367,8 @@ impl StreamCodecMessage {
             }
             StreamCodecMessage::Data(v) => {
                 ret.push(DATA_MSG_ID);
-                let sz: u32 = v.len().try_into().unwrap();
+                let sz: u32 = v.len().try_into()
+                    .expect("data message exceeds 4GB");
                 ret.extend_from_slice(&sz.to_le_bytes());
                 ret.extend(v);
             }
@@ -613,7 +614,10 @@ pub async fn run_stream(
                             },
                             StreamCodecMessage::Data(data) => {
                                 log::trace!("{}: ... data {}", name, data.len());
-                                state.sender.send(data).swallow_or_print_err(name);
+                                if let Err(e) = state.sender.send(data) {
+                                    log::error!("{}: app channel dead, stopping: {}", name, e);
+                                    break;
+                                }
                                 writer_tx.send(Some(StreamCodecMessage::Ack(state.received_one_message()).encode())).swallow_or_print_err(name);
                             }
                         }

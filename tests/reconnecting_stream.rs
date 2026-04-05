@@ -533,6 +533,94 @@ async fn test_alternating_directions_with_disconnect() {
     harness.assert_client_recv(b"D").await;
 }
 
+/// Test that when the app receiver is dropped, the reconnecting stream does NOT
+/// falsely ACK data that was never delivered to the app.
+///
+/// Bug: if sender.send(data) fails (app channel dead), the code swallows the
+/// error and still sends an ACK + increments received_seq. The remote thinks
+/// the data was delivered and drains it from sent_unacked — data loss.
+///
+/// Detection: use a tiny flow-control window (5 bytes). The internal channel
+/// has capacity 16. Fill the window with unacked data by: sending 5 bytes
+/// normally (ACKed), then dropping the receiver and sending 5 more bytes.
+/// With the bug: those 5 get falsely ACKed → window drains → we can push
+/// 16+ more messages into the channel. Without the bug: those 5 stay unacked
+/// → window is full → reconnecting stream stops reading → channel fills to
+/// capacity 16 → sender.send() blocks.
+#[tokio::test()]
+async fn test_app_channel_close_no_false_ack() {
+    let _ = env_logger::try_init();
+
+    let server_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = server_listener.local_addr().unwrap().port();
+    let proxy = Proxy::new(server_port).await.unwrap();
+
+    // Window = 5 bytes. After the first 5 bytes are ACKed, we have exactly
+    // 5 bytes of window space.
+    let (c, cs) = reconnecting_stream::StreamState::new(
+        reconnecting_stream::StreamOptions::new(5),
+    );
+    let (s, ss) = reconnecting_stream::StreamState::new(
+        reconnecting_stream::StreamOptions::new(5),
+    );
+
+    let cancel_token = CancellationToken::new();
+    let server_jh = tokio::spawn(s.run_server(server_listener, cancel_token.clone()));
+    let client_jh = tokio::spawn(c.run_client(
+        std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+        proxy.port,
+        cancel_token.clone(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send 5 bytes — fills window exactly. Wait for ACK to free it.
+    cs.sender.send(b"AAAAA".to_vec()).await.unwrap();
+    let mut server_receiver = ss.receiver;
+    let val = tokio::time::timeout(Duration::from_secs(2), server_receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(val, b"AAAAA");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Window is now free (AAAAA was ACKed).
+
+    // Drop the server's app receiver — delivery will fail.
+    drop(server_receiver);
+
+    // Send 5 bytes — fills window again. Server receives via TCP but can't
+    // deliver to app.
+    // With the bug: error swallowed, ACK sent, window freed again.
+    // Without the bug: loop breaks, no ACK, window stays full.
+    cs.sender.send(b"BBBBB".to_vec()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Now try to send 18 more 1-byte messages. The internal channel has capacity
+    // 16. If the window is full (bug fixed), the reconnecting stream won't read
+    // from the channel, so after 16 sends the channel fills and send() blocks.
+    // If the window was freed by a false ACK (bug present), the stream keeps
+    // reading and draining the channel, so all 18 sends complete.
+    let send_result = tokio::time::timeout(Duration::from_millis(500), async {
+        for i in 0..18u8 {
+            cs.sender.send(vec![i]).await.unwrap();
+        }
+    })
+    .await;
+
+    // With the bug fixed: should timeout at message ~16 (channel full, window full).
+    // With the bug: completes (false ACK freed window, stream keeps reading).
+    assert!(
+        send_result.is_err(),
+        "Expected sender to block (window + channel full), but all sends completed — \
+         B was likely falsely ACKed (data loss bug)"
+    );
+
+    cancel_token.cancel();
+    proxy.instructions_tx.send(Instruction::Close).ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_jh).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), client_jh).await;
+}
+
 #[tokio::test()]
 async fn test_empty_reconnect() {
     let mut harness = Harness::new().await.unwrap();
