@@ -20,8 +20,8 @@ use clap::Parser;
 use libmobiletunnel::process_helper::set_kill_on_parent_death;
 use libmobiletunnel::server_check_port::run_check_server_port;
 use log;
-use rand::distributions::Alphanumeric;
-use rand::Rng;
+use rand::distr::Alphanumeric;
+use rand::RngExt as _;
 use simple_logger::SimpleLogger;
 use std::env;
 use std::path::Path;
@@ -75,8 +75,8 @@ impl Args {
     fn make_location(&self, base: &str) -> Option<(String, String)> {
         let username: String = std::env::var("USER").unwrap_or("nouser".to_string());
         let base = format!("{}_{}", base, username);
-        let s: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
+        let s: String = rand::rng()
+            .sample_iter(Alphanumeric)
             .take(15)
             .map(char::from)
             .collect();
@@ -96,9 +96,8 @@ impl Args {
 }
 
 fn get_available_port() -> Result<(TcpListener, u16), Box<dyn std::error::Error>> {
-    let mut rng = rand::thread_rng();
     for _ in 0..100 {
-        let port = rng.gen_range(24000..32000);
+        let port = rand::random_range(24000..32000);
         let res = TcpListener::bind(("127.0.0.1", port))?;
         let local_port = res.local_addr()?.port();
         return Ok((res, local_port));

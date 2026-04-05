@@ -18,7 +18,6 @@ Copyright 2024 Dylan Yudaken
 
 use bytes::{BufMut, BytesMut};
 use futures::stream::StreamExt;
-use rand::Rng;
 use std::fmt::Display;
 use std::io;
 use std::net::IpAddr;
@@ -256,13 +255,11 @@ impl StreamState {
     }
 
     pub fn new(stream_options: StreamOptions) -> (StreamState, StreamSender) {
-        let mut rng = rand::thread_rng();
-
         let (tx, rx) = mpsc::channel(16);
         let (tx2, rx2) = mpsc::unbounded_channel();
         (
             StreamState {
-                id: rng.gen::<u64>(),
+                id: rand::random::<u64>(),
                 remote_id: None,
                 options: stream_options,
                 sent_unacked: Vec::new(),
