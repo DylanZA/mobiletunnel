@@ -339,3 +339,104 @@ async fn backpressure_no_stall_test() {
     );
     ct.cancel();
 }
+
+#[tokio::test()]
+async fn test_stream_disconnect_and_new_stream() {
+    let harness = Harness::new().await.unwrap();
+
+    // Connection 1: send and receive
+    let mut c1 = TcpStream::connect(format!("localhost:{}", harness.client_port))
+        .await
+        .unwrap();
+    c1.write_all(b"first").await.unwrap();
+    let mut buf = vec![0u8; 5];
+    c1.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"first");
+    drop(c1); // close connection 1
+
+    // Small delay for cleanup
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Connection 2: should work on a fresh stream
+    let mut c2 = TcpStream::connect(format!("localhost:{}", harness.client_port))
+        .await
+        .unwrap();
+    c2.write_all(b"second").await.unwrap();
+    let mut buf2 = vec![0u8; 6];
+    c2.read_exact(&mut buf2).await.unwrap();
+    assert_eq!(&buf2, b"second");
+}
+
+#[tokio::test()]
+async fn test_many_sequential_connections() {
+    let harness = Harness::new().await.unwrap();
+
+    for i in 0u32..50 {
+        let msg = format!("msg{:03}", i);
+        let mut c = TcpStream::connect(format!("localhost:{}", harness.client_port))
+            .await
+            .unwrap();
+        c.write_all(msg.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; msg.len()];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, msg.as_bytes());
+    }
+}
+
+#[tokio::test()]
+async fn test_concurrent_large_and_small() {
+    let harness = Harness::new().await.unwrap();
+    let port = harness.client_port;
+
+    // Large transfer
+    let large_task = tokio::spawn(async move {
+        let mut c = TcpStream::connect(format!("localhost:{}", port)).await.unwrap();
+        let payload: Vec<u8> = (0..65536).map(|i| (i % 251) as u8).collect();
+        c.write_all(&payload).await.unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, payload);
+    });
+
+    // Small transfer (concurrent)
+    let port2 = harness.client_port;
+    let small_task = tokio::spawn(async move {
+        let mut c = TcpStream::connect(format!("localhost:{}", port2)).await.unwrap();
+        c.write_all(b"hi").await.unwrap();
+        let mut buf = vec![0u8; 2];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hi");
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        large_task.await.unwrap();
+        small_task.await.unwrap();
+    })
+    .await;
+    assert!(result.is_ok(), "Concurrent transfers timed out");
+}
+
+#[tokio::test()]
+async fn test_connection_close_midstream() {
+    let harness = Harness::new().await.unwrap();
+
+    // Open a connection and start writing, then close abruptly
+    {
+        let mut c = TcpStream::connect(format!("localhost:{}", harness.client_port))
+            .await
+            .unwrap();
+        c.write_all(&vec![0u8; 1024]).await.unwrap();
+        // Drop without reading — abrupt close
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Subsequent connection should still work
+    let mut c2 = TcpStream::connect(format!("localhost:{}", harness.client_port))
+        .await
+        .unwrap();
+    c2.write_all(b"ok").await.unwrap();
+    let mut buf = vec![0u8; 2];
+    c2.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ok");
+}

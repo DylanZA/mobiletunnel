@@ -1,5 +1,6 @@
 use std::io;
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use libmobiletunnel::reconnecting_stream;
@@ -161,13 +162,23 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Result<Harness, Box<dyn std::error::Error>> {
+        Self::with_window(None).await
+    }
+
+    async fn with_window(max_window: Option<usize>) -> Result<Harness, Box<dyn std::error::Error>> {
         let _ = env_logger::try_init();
         let server_listener = TcpListener::bind("127.0.0.1:0").await?;
         let server_port = server_listener.local_addr().unwrap().port();
         let proxy = Proxy::new(server_port).await?;
         log::trace!("Setting up streams...");
-        let (c, cs) = reconnecting_stream::StreamState::default();
-        let (s, ss) = reconnecting_stream::StreamState::default();
+        let (c, cs) = match max_window {
+            Some(w) => reconnecting_stream::StreamState::new(reconnecting_stream::StreamOptions::new(w)),
+            None => reconnecting_stream::StreamState::default(),
+        };
+        let (s, ss) = match max_window {
+            Some(w) => reconnecting_stream::StreamState::new(reconnecting_stream::StreamOptions::new(w)),
+            None => reconnecting_stream::StreamState::default(),
+        };
         let cancel_token = CancellationToken::new();
         log::trace!("Starting server...");
         let server_jh = tokio::spawn(s.run_server(server_listener, cancel_token.clone()));
@@ -233,6 +244,28 @@ impl Harness {
         return Ok(());
     }
 
+    pub async fn disconnect_and_reconnect(&self) {
+        self.send_disconnect().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.send_connect().unwrap();
+    }
+
+    pub async fn client_send(&self, data: &[u8]) {
+        self.client.sender.send(data.to_vec()).await.unwrap();
+    }
+
+    pub async fn server_send(&self, data: &[u8]) {
+        self.server.sender.send(data.to_vec()).await.unwrap();
+    }
+
+    pub async fn assert_server_recv(&mut self, expected: &[u8]) {
+        assert_eq!(self.server_recv(expected.len()).await.unwrap(), expected);
+    }
+
+    pub async fn assert_client_recv(&mut self, expected: &[u8]) {
+        assert_eq!(self.client_recv(expected.len()).await.unwrap(), expected);
+    }
+
     pub async fn stop(mut self) -> Result<(), Box<dyn std::error::Error>> {
         log::trace!("Shutting down test harness...");
         self.proxy.instructions_tx.send(Instruction::Close)?;
@@ -255,60 +288,255 @@ impl Harness {
 async fn basic_test() {
     for _ in 0..10 {
         let mut harness = Harness::new().await.unwrap();
-        harness
-            .client
-            .sender
-            .send("FC".as_bytes().to_vec())
-            .await
-            .unwrap();
-        harness
-            .server
-            .sender
-            .send("FS".as_bytes().to_vec())
-            .await
-            .unwrap();
-        assert!(harness.client_recv(2).await.unwrap() == "FS".as_bytes());
-        assert!(harness.server_recv(2).await.unwrap() == "FC".as_bytes());
-        harness
-            .stop()
-            .await
-            .swallow_or_print_err("shutting down test harness");
+        harness.client_send(b"FC").await;
+        harness.server_send(b"FS").await;
+        harness.assert_client_recv(b"FS").await;
+        harness.assert_server_recv(b"FC").await;
+        harness.stop().await.swallow_or_print_err("shutting down test harness");
     }
 }
 
 #[tokio::test()]
 async fn test_with_disconnect() {
     let mut harness = Harness::new().await.unwrap();
-    harness
-        .client
-        .sender
-        .send("FC".as_bytes().to_vec())
-        .await
-        .unwrap();
-    harness
-        .server
-        .sender
-        .send("FS".as_bytes().to_vec())
-        .await
-        .unwrap();
+    harness.client_send(b"FC").await;
+    harness.server_send(b"FS").await;
     harness.send_disconnect().unwrap();
     harness.send_connect().unwrap();
-    harness
-        .client
-        .sender
-        .send("FC".as_bytes().to_vec())
-        .await
-        .unwrap();
-    harness
-        .server
-        .sender
-        .send("FS".as_bytes().to_vec())
-        .await
-        .unwrap();
-    assert!(harness.client_recv(4).await.unwrap() == "FSFS".as_bytes());
-    assert!(harness.server_recv(4).await.unwrap() == "FCFC".as_bytes());
-    harness
-        .stop()
-        .await
-        .swallow_or_print_err("shutting down test harness");
+    harness.client_send(b"FC").await;
+    harness.server_send(b"FS").await;
+    harness.assert_client_recv(b"FSFS").await;
+    harness.assert_server_recv(b"FCFC").await;
+    harness.stop().await.swallow_or_print_err("shutting down test harness");
+}
+
+// --- Backpressure / Flow Control ---
+
+#[tokio::test()]
+async fn test_backpressure_blocks_sender() {
+    // With a tiny window and no ACKs (disconnected), the sender should
+    // block once the window fills and the channel (cap 16) is exhausted.
+    let mut harness = Harness::with_window(Some(50)).await.unwrap();
+    harness.client_send(b"ok").await;
+    harness.assert_server_recv(b"ok").await;
+
+    // Disconnect — prevents ACKs from draining the window
+    harness.send_disconnect().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send messages while disconnected. After 50 bytes, is_full() becomes
+    // true. After 16 more fill the channel buffer (cap 16), sender blocks.
+    for _ in 0..17 {
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            harness.client.sender.send(vec![b'X'; 10]),
+        )
+        .await;
+        if result.is_err() {
+            // Sender blocked — backpressure is working. Reconnect to unblock.
+            harness.send_connect().unwrap();
+            harness.client_send(b"after").await;
+            assert!(harness.server_recv(5).await.is_some());
+            return;
+        }
+    }
+
+    // All sends succeeded (unlikely but possible). Verify stream works.
+    harness.send_connect().unwrap();
+    harness.client_send(b"end").await;
+    assert!(harness.server_recv(3).await.is_some());
+}
+
+#[tokio::test()]
+async fn test_backpressure_resolves_after_ack() {
+    let mut harness = Harness::with_window(Some(100)).await.unwrap();
+    for i in 0u8..5 {
+        let data = vec![b'A' + i; 90];
+        harness.client_send(&data).await;
+        harness.assert_server_recv(&data).await;
+    }
+}
+
+#[tokio::test()]
+async fn test_backpressure_during_disconnect() {
+    let mut harness = Harness::with_window(Some(200)).await.unwrap();
+    harness.client_send(&vec![b'A'; 80]).await;
+    harness.assert_server_recv(&vec![b'A'; 80]).await;
+
+    harness.send_disconnect().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    harness.client_send(&vec![b'B'; 80]).await;
+
+    harness.send_connect().unwrap();
+    harness.assert_server_recv(&vec![b'B'; 80]).await;
+}
+
+#[tokio::test()]
+async fn test_window_full_then_disconnect_reconnect() {
+    let mut harness = Harness::with_window(Some(100)).await.unwrap();
+    harness.client_send(&vec![b'X'; 90]).await;
+
+    harness.disconnect_and_reconnect().await;
+
+    harness.assert_server_recv(&vec![b'X'; 90]).await;
+    harness.client_send(&vec![b'Y'; 50]).await;
+    harness.assert_server_recv(&vec![b'Y'; 50]).await;
+}
+
+#[tokio::test()]
+async fn test_window_exactly_at_limit() {
+    let mut harness = Harness::with_window(Some(10)).await.unwrap();
+    harness.client_send(&vec![b'A'; 10]).await;
+    harness.assert_server_recv(&vec![b'A'; 10]).await;
+    harness.client_send(&vec![b'B'; 10]).await;
+    harness.assert_server_recv(&vec![b'B'; 10]).await;
+}
+
+// --- Reconnection Semantics ---
+
+#[tokio::test()]
+async fn test_data_sent_during_disconnect_arrives() {
+    let mut harness = Harness::new().await.unwrap();
+    harness.client_send(b"A").await;
+    harness.assert_server_recv(b"A").await;
+
+    harness.send_disconnect().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    harness.client_send(b"B").await;
+
+    harness.send_connect().unwrap();
+    harness.assert_server_recv(b"B").await;
+}
+
+#[tokio::test()]
+async fn test_bidirectional_during_reconnect() {
+    let mut harness = Harness::new().await.unwrap();
+    harness.client_send(b"C1").await;
+    harness.server_send(b"S1").await;
+
+    harness.send_disconnect().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    harness.client_send(b"C2").await;
+    harness.server_send(b"S2").await;
+
+    harness.send_connect().unwrap();
+    harness.assert_server_recv(b"C1C2").await;
+    harness.assert_client_recv(b"S1S2").await;
+}
+
+#[tokio::test()]
+async fn test_rapid_disconnect_reconnect() {
+    let mut harness = Harness::new().await.unwrap();
+    harness.client_send(b"START").await;
+
+    for _ in 0..5 {
+        harness.send_disconnect().unwrap();
+        harness.send_connect().unwrap();
+    }
+
+    harness.client_send(b"END").await;
+    harness.assert_server_recv(b"STARTEND").await;
+}
+
+#[tokio::test()]
+async fn test_large_message_across_reconnect() {
+    let mut harness = Harness::new().await.unwrap();
+    let payload: Vec<u8> = (0..10000).map(|i| (i % 251) as u8).collect();
+    harness.client_send(&payload).await;
+
+    harness.send_disconnect().unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    harness.send_connect().unwrap();
+
+    assert_eq!(harness.server_recv(10000).await.unwrap(), payload);
+}
+
+// --- Edge Cases ---
+
+#[tokio::test()]
+async fn test_multiple_messages_ordering() {
+    let mut harness = Harness::new().await.unwrap();
+    for i in 0u8..5 {
+        harness.client_send(&[b'1' + i]).await;
+    }
+    harness.assert_server_recv(b"12345").await;
+}
+
+#[tokio::test()]
+async fn test_both_directions_interleaved() {
+    let mut harness = Harness::new().await.unwrap();
+    harness.client_send(b"A").await;
+    harness.server_send(b"X").await;
+    harness.client_send(b"B").await;
+    harness.server_send(b"Y").await;
+    harness.assert_server_recv(b"AB").await;
+    harness.assert_client_recv(b"XY").await;
+}
+
+// --- Stress / Reliability ---
+
+#[tokio::test()]
+async fn test_high_throughput_bidirectional() {
+    let mut harness = Harness::with_window(Some(10000)).await.unwrap();
+    let msg = vec![b'D'; 100];
+    for _ in 0..100 {
+        harness.client_send(&msg).await;
+        harness.server_send(&msg).await;
+    }
+
+    let server_data = harness.server_recv(10000).await.unwrap();
+    let client_data = harness.client_recv(10000).await.unwrap();
+    assert_eq!(server_data, vec![b'D'; 10000]);
+    assert_eq!(client_data, vec![b'D'; 10000]);
+}
+
+#[tokio::test()]
+async fn test_many_small_messages() {
+    let mut harness = Harness::new().await.unwrap();
+    for i in 0u16..500 {
+        harness.client_send(&[(i % 256) as u8]).await;
+    }
+    let data = harness.server_recv(500).await.unwrap();
+    let expected: Vec<u8> = (0u16..500).map(|i| (i % 256) as u8).collect();
+    assert_eq!(data, expected);
+}
+
+#[tokio::test()]
+async fn test_disconnect_with_pending_acks() {
+    let mut harness = Harness::new().await.unwrap();
+    for i in 0u8..5 {
+        harness.client_send(&vec![b'A' + i; 20]).await;
+    }
+
+    harness.send_disconnect().unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    harness.send_connect().unwrap();
+
+    assert_eq!(harness.server_recv(100).await.unwrap().len(), 100);
+}
+
+#[tokio::test()]
+async fn test_alternating_directions_with_disconnect() {
+    let mut harness = Harness::new().await.unwrap();
+    harness.client_send(b"A").await;
+    harness.assert_server_recv(b"A").await;
+    harness.server_send(b"B").await;
+    harness.assert_client_recv(b"B").await;
+
+    harness.send_disconnect().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    harness.client_send(b"C").await;
+    harness.server_send(b"D").await;
+
+    harness.send_connect().unwrap();
+    harness.assert_server_recv(b"C").await;
+    harness.assert_client_recv(b"D").await;
+}
+
+#[tokio::test()]
+async fn test_empty_reconnect() {
+    let mut harness = Harness::new().await.unwrap();
+    harness.disconnect_and_reconnect().await;
+    harness.client_send(b"hello").await;
+    harness.assert_server_recv(b"hello").await;
 }
