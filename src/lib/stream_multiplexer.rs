@@ -31,22 +31,22 @@ use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct OngoingStreamId(u64);
+pub struct OngoingStreamId(pub u64);
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct ConnectMsg {
-    stream_id: OngoingStreamId,
+    pub stream_id: OngoingStreamId,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct DisconnectMsg {
-    stream_id: OngoingStreamId,
+    pub stream_id: OngoingStreamId,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct DataMsg {
-    stream_id: OngoingStreamId,
-    to_send: Vec<u8>,
+    pub stream_id: OngoingStreamId,
+    pub to_send: Vec<u8>,
 }
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct ErrorMsg {
@@ -187,7 +187,7 @@ impl ChannelMessage {
         return Ok(Some((msg, frame_size)));
     }
 
-    fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let mut ret: Vec<u8> = vec![];
         match &self {
             &ChannelMessage::Connect(m) => {
@@ -313,11 +313,15 @@ async fn run_internal_stream(
                                 && write_flow.sent_pause.swap(false, Ordering::Relaxed)
                             {
                                 log::debug!("Stream {:?} below low-water, sending RESUME", write_sid.0);
-                                let _ = write_channel_tx
+                                if let Err(e) = write_channel_tx
                                     .send(ChannelMessage::Resume(ResumeMsg {
                                         stream_id: write_sid.clone(),
                                     }))
-                                    .await;
+                                    .await
+                                {
+                                    log::warn!("Failed to send RESUME for stream {:?}: {}", write_sid.0, e);
+                                    break;
+                                }
                             }
                         }
                         Some(ChannelMessage::Disconnect(_)) => {
@@ -570,14 +574,23 @@ impl OngoingStreamTracker {
                 && !x.flow.sent_pause.swap(true, Ordering::Relaxed)
             {
                 log::debug!("Stream {:?} above high-water ({}), sending PAUSE", id.0, pending);
-                into_channel_tx
-                    .send(
-                        ChannelMessage::Pause(PauseMsg {
-                            stream_id: id,
-                        })
-                        .encode(),
-                    )
-                    .await?;
+                match into_channel_tx.try_send(
+                    ChannelMessage::Pause(PauseMsg {
+                        stream_id: id,
+                    })
+                    .encode(),
+                ) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Channel full — natural backpressure is already active
+                        // (the multiplexer run loop will block on the next data
+                        // send). Reset sent_pause so we retry on the next message.
+                        x.flow.sent_pause.store(false, Ordering::Relaxed);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Err("channel closed")?;
+                    }
+                }
             }
         } else {
             log::debug!("Got message for {:?} but it is not running", &sd.stream_id);

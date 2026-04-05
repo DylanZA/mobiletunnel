@@ -510,6 +510,109 @@ async fn test_concurrent_large_and_small() {
     assert!(result.is_ok(), "Concurrent transfers timed out");
 }
 
+/// Test that PAUSE sending does not block the multiplexer's inbound processing.
+///
+/// When a per-stream unbounded channel fills to HIGH_WATER (64), data() sends a
+/// PAUSE via into_channel_tx. If this uses send().await and the channel is full,
+/// it blocks process_channel_rx — which is called inline, not as a select! arm —
+/// stalling the entire run loop.
+///
+/// Setup: target server holds connections open (no EOF, no Disconnect messages).
+/// Server→client channel (capacity 1) is never drained. We send Connect for
+/// stream 1, then flood it with 100 Data frames in one blob. Frame 64 triggers
+/// PAUSE. After the blob, we send Connect for stream 2. If the server processed
+/// all 100 frames (fix), it's back in the select loop and processes the Connect,
+/// opening a TCP connection to the target. If stuck (bug), stream 2 never connects.
+#[tokio::test()]
+async fn test_pause_does_not_block_multiplexer() {
+    use libmobiletunnel::stream_multiplexer::*;
+
+    let _ = env_logger::try_init();
+    let ct = CancellationToken::new();
+
+    // Target: accepts connections and holds them open. Notifies us on each connect.
+    let (conn_notify_tx, mut conn_notify_rx) = mpsc::channel::<()>(10);
+    let target_listener = TcpListener::bind("localhost:0").await.unwrap();
+    let target_port = target_listener.local_addr().unwrap().port();
+    let ct_target = ct.child_token();
+    tokio::spawn(async move {
+        let mut _held = vec![];
+        loop {
+            tokio::select! {
+                _ = ct_target.cancelled() => break,
+                r = target_listener.accept() => {
+                    match r {
+                        Ok((stream, _)) => {
+                            _held.push(stream);
+                            let _ = conn_notify_tx.send(()).await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    });
+
+    // Server→client channel: capacity 1, NEVER drained.
+    // Pre-fill it so PAUSE send finds it full.
+    let (server_into_tx, _server_into_rx) = mpsc::channel::<Vec<u8>>(1);
+    server_into_tx.try_send(vec![0u8]).unwrap(); // fill the one slot
+    let (feed_tx, feed_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    let mut serverm = StreamMultiplexerServer::new(
+        StreamMultiplexerServerOptions {
+            target_port,
+            target_address: "localhost".to_string(),
+        },
+        server_into_tx,
+        feed_rx,
+    )
+    .unwrap();
+
+    let ct2 = ct.child_token();
+    tokio::spawn(async move {
+        serverm.run(ct2).await.swallow_or_print_err("server mux");
+    });
+
+    // Connect stream 1 — verify target gets a TCP connection
+    feed_tx
+        .send(ChannelMessage::Connect(ConnectMsg { stream_id: OngoingStreamId(1) }).encode())
+        .unwrap();
+    let got_conn = tokio::time::timeout(Duration::from_secs(2), conn_notify_rx.recv()).await;
+    assert!(got_conn.is_ok(), "Stream 1 connect failed");
+
+    // Flood stream 1: 100 Data frames + Connect for stream 2, ALL in one blob.
+    // process_channel_rx parses them in a loop. Frame 64 triggers PAUSE.
+    // With send().await, it blocks and frames 65-100 + the Connect for stream 2
+    // are never processed. With try_send (fix), all frames + the Connect are
+    // processed in one call, and stream 2 connects to the target.
+    let mut blob = Vec::new();
+    for i in 0..100u32 {
+        blob.extend(
+            ChannelMessage::Data(DataMsg {
+                stream_id: OngoingStreamId(1),
+                to_send: vec![i as u8; 100],
+            })
+            .encode(),
+        );
+    }
+    // Append Connect for stream 2 at the end of the same blob
+    blob.extend(
+        ChannelMessage::Connect(ConnectMsg { stream_id: OngoingStreamId(2) }).encode(),
+    );
+    feed_tx.send(blob).unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(3), conn_notify_rx.recv()).await;
+    assert!(
+        result.is_ok(),
+        "Stream 2 connect never processed — PAUSE send likely blocked the multiplexer"
+    );
+
+    ct.cancel();
+
+    ct.cancel();
+}
+
 #[tokio::test()]
 async fn test_connection_close_midstream() {
     let harness = Harness::new().await.unwrap();
