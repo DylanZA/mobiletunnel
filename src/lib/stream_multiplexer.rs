@@ -21,10 +21,12 @@ use std::error;
 use std::fmt;
 use std::io;
 use std::str;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
@@ -53,17 +55,37 @@ pub struct ErrorMsg {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct PauseMsg {
+    stream_id: OngoingStreamId,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct ResumeMsg {
+    stream_id: OngoingStreamId,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum ChannelMessage {
     Connect(ConnectMsg),
     Data(DataMsg),
     Disconnect(DisconnectMsg),
     Error(ErrorMsg),
+    Pause(PauseMsg),
+    Resume(ResumeMsg),
 }
 
 const CONNECT_MSG_ID: u8 = 1;
 const DATA_MSG_ID: u8 = 2;
 const ERROR_MSG_ID: u8 = 3;
 const DISCONNECT_MSG_ID: u8 = 4;
+const PAUSE_MSG_ID: u8 = 5;
+const RESUME_MSG_ID: u8 = 6;
+
+/// Per-stream pending message count at which we send PAUSE to the remote,
+/// telling it to stop reading from its TCP socket for this stream.
+const BACKPRESSURE_HIGH_WATER: usize = 64;
+/// Once a paused stream drains below this count, we send RESUME.
+const BACKPRESSURE_LOW_WATER: usize = 16;
 
 impl ChannelMessage {
     fn to_string(&self) -> String {
@@ -72,6 +94,8 @@ impl ChannelMessage {
             ChannelMessage::Data(d) => format!("Data({:?}) n={}", d.stream_id, d.to_send.len()),
             ChannelMessage::Disconnect(d) => format!("Disconnect({:?})", d.stream_id),
             ChannelMessage::Error(d) => format!("Error({:?}) {}", d.stream_id, d.message),
+            ChannelMessage::Pause(d) => format!("Pause({:?})", d.stream_id),
+            ChannelMessage::Resume(d) => format!("Resume({:?})", d.stream_id),
         }
     }
 
@@ -139,6 +163,22 @@ impl ChannelMessage {
                 };
                 Ok(ChannelMessage::Error(sc))
             }
+            PAUSE_MSG_ID => {
+                if len != 13 {
+                    return Err("Expected 13 len for pause")?;
+                }
+                Ok(ChannelMessage::Pause(PauseMsg {
+                    stream_id: connection_id,
+                }))
+            }
+            RESUME_MSG_ID => {
+                if len != 13 {
+                    return Err("Expected 13 len for resume")?;
+                }
+                Ok(ChannelMessage::Resume(ResumeMsg {
+                    stream_id: connection_id,
+                }))
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!("unknown msg id {}!", data[0]),
@@ -195,6 +235,16 @@ impl ChannelMessage {
                     }
                 }
             }
+            &ChannelMessage::Pause(ref m) => {
+                ret.push(PAUSE_MSG_ID);
+                ret.extend_from_slice(&13u32.to_le_bytes());
+                ret.extend_from_slice(&m.stream_id.0.to_le_bytes());
+            }
+            &ChannelMessage::Resume(ref m) => {
+                ret.push(RESUME_MSG_ID);
+                ret.extend_from_slice(&13u32.to_le_bytes());
+                ret.extend_from_slice(&m.stream_id.0.to_le_bytes());
+            }
         }
         ret
     }
@@ -214,17 +264,22 @@ async fn run_internal_stream(
     stream: TcpStream,
     stream_id: OngoingStreamId,
     channel_tx: mpsc::Sender<ChannelMessage>,
-    mut channel_rx: mpsc::Receiver<Option<ChannelMessage>>,
+    mut channel_rx: mpsc::UnboundedReceiver<Option<ChannelMessage>>,
+    flow: Arc<StreamFlowControl>,
     interrupt: CancellationToken,
 ) -> Result<(), io::Error> {
     let (mut read_half, mut write_half) = stream.into_split();
     let done = CancellationToken::new();
 
     // Write task: drains channel_rx and writes to TCP independently.
-    // A slow write_all no longer blocks channel consumption or TCP reads.
+    // After each message, decrements the pending counter. If below
+    // low-water mark and we previously sent PAUSE, sends RESUME.
     let write_done = done.clone();
     let write_done2 = done.clone();
     let write_interrupt = interrupt.clone();
+    let write_flow = flow.clone();
+    let write_sid = stream_id.clone();
+    let write_channel_tx = channel_tx.clone();
     let write_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -240,8 +295,6 @@ async fn run_internal_stream(
                     match msg.flatten() {
                         Some(ChannelMessage::Data(sd)) => {
                             log::debug!("Got {} bytes from app, sending to TcpStream", sd.to_send.len());
-                            // Select on cancellation alongside write_all so we
-                            // don't get stuck if the target stops reading.
                             tokio::select! {
                                 _ = write_done2.cancelled() => {
                                     log::debug!("write cancelled during write_all");
@@ -254,6 +307,18 @@ async fn run_internal_stream(
                                     }
                                 }
                             }
+                            // Decrement pending count; send RESUME if we cross low-water
+                            let prev = write_flow.pending.fetch_sub(1, Ordering::Relaxed);
+                            if prev <= BACKPRESSURE_LOW_WATER
+                                && write_flow.sent_pause.swap(false, Ordering::Relaxed)
+                            {
+                                log::debug!("Stream {:?} below low-water, sending RESUME", write_sid.0);
+                                let _ = write_channel_tx
+                                    .send(ChannelMessage::Resume(ResumeMsg {
+                                        stream_id: write_sid.clone(),
+                                    }))
+                                    .await;
+                            }
                         }
                         Some(ChannelMessage::Disconnect(_)) => {
                             log::debug!("disconnect!");
@@ -263,8 +328,10 @@ async fn run_internal_stream(
                             log::debug!("error!");
                             break;
                         }
-                        Some(ChannelMessage::Connect(_)) => {
-                            log::error!("Weird connect");
+                        Some(ChannelMessage::Connect(_))
+                        | Some(ChannelMessage::Pause(_))
+                        | Some(ChannelMessage::Resume(_)) => {
+                            log::error!("Unexpected message in write task");
                             break;
                         }
                         None => {
@@ -279,12 +346,27 @@ async fn run_internal_stream(
     });
 
     // Read task: reads from TCP and sends to multiplexer.
+    // Respects the read_paused flag set when the remote sends PAUSE.
     let read_done = done.clone();
     let read_interrupt = interrupt.clone();
+    let read_flow = flow.clone();
     let sid = stream_id.clone();
     let read_task = tokio::spawn(async move {
         let mut rx_bytes = [0u8; 4096];
         loop {
+            // If paused by the remote, wait for RESUME notification.
+            if read_flow.read_paused.load(Ordering::Relaxed) {
+                log::debug!("Read task paused for stream {:?}", sid.0);
+                tokio::select! {
+                    _ = read_done.cancelled() => break,
+                    _ = read_interrupt.cancelled() => break,
+                    _ = read_flow.read_resume_notify.notified() => {
+                        log::debug!("Read task resumed for stream {:?}", sid.0);
+                        continue;
+                    }
+                }
+            }
+
             tokio::select! {
                 _ = read_done.cancelled() => {
                     log::trace!("read task cancelled");
@@ -324,11 +406,8 @@ async fn run_internal_stream(
         }
     });
 
-    // Ensure sub-tasks are cancelled when this function exits for any reason
-    // (including abort). drop_guard cancels `done` when dropped.
     let _drop_guard = done.drop_guard();
 
-    // When either task finishes, the drop_guard cancels the other.
     tokio::select! {
         _ = write_task => {
             log::debug!("Write task finished for {}", stream_id.0);
@@ -341,10 +420,22 @@ async fn run_internal_stream(
     Ok(())
 }
 
+/// Shared state for per-stream backpressure signaling.
+struct StreamFlowControl {
+    /// Number of messages pending in the unbounded channel.
+    pending: AtomicUsize,
+    /// Whether we've sent PAUSE to the remote for this stream's inbound data.
+    sent_pause: AtomicBool,
+    /// Whether the remote sent PAUSE for this stream's outbound data.
+    read_paused: AtomicBool,
+    /// Notifies the read task when RESUME is received.
+    read_resume_notify: Notify,
+}
+
 struct OngoingStreamState {
-    // send into the stream
-    into_stream_tx: mpsc::Sender<Option<ChannelMessage>>,
+    into_stream_tx: mpsc::UnboundedSender<Option<ChannelMessage>>,
     join_handle: tokio::task::JoinHandle<()>,
+    flow: Arc<StreamFlowControl>,
 }
 
 #[derive(Debug, Clone)]
@@ -460,24 +551,51 @@ impl OngoingStreamTracker {
         }
     }
 
-    async fn data(&mut self, sd: DataMsg) -> Result<(), MultiplexerError> {
+    async fn data(
+        &mut self,
+        sd: DataMsg,
+        into_channel_tx: &mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), MultiplexerError> {
         let id = sd.stream_id.clone();
         if let Some(x) = self.streams.get_mut(&sd.stream_id) {
-            match x.into_stream_tx.try_send(Some(ChannelMessage::Data(sd))) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    log::warn!("Stream {:?} channel full, dropping connection", id);
-                    self.remove(&id).await;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    log::debug!("Stream {:?} channel closed, removing", id);
-                    self.remove(&id).await;
-                }
+            // Unbounded send — never blocks the multiplexer.
+            if let Err(e) = x.into_stream_tx.send(Some(ChannelMessage::Data(sd))) {
+                log::debug!("Stream {:?} channel closed: {}", id, e);
+                self.remove(&id).await;
+                return Ok(());
+            }
+            // Track pending count; send PAUSE if we cross high-water.
+            let pending = x.flow.pending.fetch_add(1, Ordering::Relaxed) + 1;
+            if pending >= BACKPRESSURE_HIGH_WATER
+                && !x.flow.sent_pause.swap(true, Ordering::Relaxed)
+            {
+                log::debug!("Stream {:?} above high-water ({}), sending PAUSE", id.0, pending);
+                into_channel_tx
+                    .send(
+                        ChannelMessage::Pause(PauseMsg {
+                            stream_id: id,
+                        })
+                        .encode(),
+                    )
+                    .await?;
             }
         } else {
             log::debug!("Got message for {:?} but it is not running", &sd.stream_id);
         }
         Ok(())
+    }
+
+    fn pause_read(&self, id: &OngoingStreamId) {
+        if let Some(x) = self.streams.get(id) {
+            x.flow.read_paused.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn resume_read(&self, id: &OngoingStreamId) {
+        if let Some(x) = self.streams.get(id) {
+            x.flow.read_paused.store(false, Ordering::Relaxed);
+            x.flow.read_resume_notify.notify_one();
+        }
     }
 
     async fn new_stream(
@@ -492,8 +610,15 @@ impl OngoingStreamTracker {
         }
 
         let to_channel_tx = self.to_channel_tx.clone();
-        let (into_stream_tx, from_channel_rx) = mpsc::channel(64);
+        let (into_stream_tx, from_channel_rx) = mpsc::unbounded_channel();
+        let flow = Arc::new(StreamFlowControl {
+            pending: AtomicUsize::new(0),
+            sent_pause: AtomicBool::new(false),
+            read_paused: AtomicBool::new(false),
+            read_resume_notify: Notify::new(),
+        });
         let idc = id.clone();
+        let task_flow = flow.clone();
         let jh = tokio::spawn(async move {
             let to_channel_tx_2 = to_channel_tx.clone();
             let conn_res = match conn_factory {
@@ -510,6 +635,7 @@ impl OngoingStreamTracker {
                         idc.clone(),
                         to_channel_tx,
                         from_channel_rx,
+                        task_flow,
                         interrupt,
                     )
                     .await
@@ -526,6 +652,7 @@ impl OngoingStreamTracker {
         let state = OngoingStreamState {
             into_stream_tx,
             join_handle: jh,
+            flow,
         };
         self.streams.insert(id, state);
         return Ok(());
@@ -584,11 +711,19 @@ impl StreamMultiplexerServer {
                 }
                 Some(ChannelMessage::Data(sd)) => {
                     log::debug!("Server got data {}", sd.to_send.len());
-                    self.streams.data(sd).await?;
+                    self.streams.data(sd, &self.into_channel_tx).await?;
                 }
                 Some(ChannelMessage::Disconnect(sd)) => {
                     log::debug!("Server got disconnect {}", sd.stream_id.0);
                     self.streams.remove(&sd.stream_id).await;
+                }
+                Some(ChannelMessage::Pause(p)) => {
+                    log::debug!("Server got pause for stream {}", p.stream_id.0);
+                    self.streams.pause_read(&p.stream_id);
+                }
+                Some(ChannelMessage::Resume(r)) => {
+                    log::debug!("Server got resume for stream {}", r.stream_id.0);
+                    self.streams.resume_read(&r.stream_id);
                 }
             }
         }
@@ -673,11 +808,19 @@ impl StreamMultiplexerClient {
                 }
                 Some(ChannelMessage::Data(sd)) => {
                     log::debug!("Client got data {}", sd.to_send.len());
-                    self.streams.data(sd).await?;
+                    self.streams.data(sd, &self.to_channel_tx).await?;
                 }
                 Some(ChannelMessage::Disconnect(sd)) => {
                     log::debug!("Client got disconnect {}", sd.stream_id.0);
                     self.streams.remove(&sd.stream_id).await;
+                }
+                Some(ChannelMessage::Pause(p)) => {
+                    log::debug!("Client got pause for stream {}", p.stream_id.0);
+                    self.streams.pause_read(&p.stream_id);
+                }
+                Some(ChannelMessage::Resume(r)) => {
+                    log::debug!("Client got resume for stream {}", r.stream_id.0);
+                    self.streams.resume_read(&r.stream_id);
                 }
             }
         }
@@ -834,6 +977,24 @@ mod tests {
         buf.extend_from_slice(&10u32.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
         assert!(ChannelMessage::parse(&buf).is_err());
+    }
+
+    #[test]
+    fn test_roundtrip_pause() {
+        let msg = ChannelMessage::Pause(PauseMsg { stream_id: sid(11) });
+        let encoded = msg.encode();
+        let parsed = ChannelMessage::parse(&encoded).unwrap().unwrap();
+        assert_eq!(parsed.1, encoded.len());
+        assert_eq!(parsed.0, msg);
+    }
+
+    #[test]
+    fn test_roundtrip_resume() {
+        let msg = ChannelMessage::Resume(ResumeMsg { stream_id: sid(22) });
+        let encoded = msg.encode();
+        let parsed = ChannelMessage::parse(&encoded).unwrap().unwrap();
+        assert_eq!(parsed.1, encoded.len());
+        assert_eq!(parsed.0, msg);
     }
 
     #[test]
